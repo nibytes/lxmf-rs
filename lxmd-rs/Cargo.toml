@@ -1,0 +1,15 @@
+[package]
+name = "lxmd-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.23", features = ["derive"] }
+lxmf-rs = { path = "../lxmf-rs", features = ["rns"] }
+rand_core = "0.6.4"
+reticulum = { path = "../reticulum-patched", default-features = false, features = ["alloc"] }
+serde = { version = "1.0.217", features = ["derive"] }
+tokio = { version = "1.43.0", features = ["macros", "rt-multi-thread", "time"] }
+toml = "0.8.19"
+env_logger = "0.10"
+log = "0.4.27"

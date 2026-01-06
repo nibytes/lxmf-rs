@@ -1,0 +1,29 @@
+[package]
+name = "lxmf-rs"
+version = "0.1.0"
+edition = "2021"
+license-file = "../LICENSE"
+description = "Rust port of the LXMF message format (encode/decode, hash, Ed25519 signature)"
+
+[features]
+default = []
+rns = ["reticulum", "tokio"]
+
+[dependencies]
+base64 = "0.22"
+ed25519-dalek = "2"
+hex = "0.4.3"
+hkdf = "0.12"
+rmpv = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+reticulum = { version = "0.1.0", optional = true, default-features = false, features = ["alloc"] }
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time"], optional = true }
+qrcode = "0.14"
+sha2 = "0.10"
+thiserror = "1"
+
+[dev-dependencies]
+tokio = { version = "1.49", features = ["rt-multi-thread", "macros", "time"] }
+
+[patch.crates-io]
+reticulum = { path = "../reticulum-patched" }

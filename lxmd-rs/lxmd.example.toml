@@ -1,0 +1,39 @@
+storage_path = "/var/lib/lxmd"
+identity_path = "/var/lib/lxmd/identity"
+inbound_dir = "/var/lib/lxmd/messages"
+bind_addr = "127.0.0.1:4242"
+forward_addr = "127.0.0.1:4242"
+tick_interval_ms = 1000
+node_name = "lxmd-rs"
+
+[logging]
+loglevel = 3
+
+[lxmf]
+display_name = "Anonymous Peer"
+announce_at_start = false
+announce_interval = 60
+delivery_transfer_max_accepted_size = 1000.0
+on_inbound = ""
+
+[propagation]
+enable_node = false
+node_name = "Anonymous Propagation Node"
+auth_required = false
+announce_at_start = true
+autopeer = true
+autopeer_maxdepth = 4
+announce_interval = 360
+message_storage_limit = 500.0
+propagation_transfer_max_accepted_size = 256.0
+propagation_message_max_accepted_size = 256.0
+propagation_sync_max_accepted_size = 10240.0
+propagation_stamp_cost_target = 16
+propagation_stamp_cost_flexibility = 3
+peering_cost = 18
+remote_peering_cost_max = 26
+prioritise_destinations = []
+control_allowed = []
+static_peers = []
+# max_peers = 0
+from_static_only = false

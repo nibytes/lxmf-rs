@@ -1,0 +1,2714 @@
+use crate::constants::{
+    DESTINATION_LENGTH, FIELD_TICKET, HASH_LENGTH, MESSAGE_EXPIRY, STATE_DELIVERED, STATE_FAILED,
+    STATE_OUTBOUND, STATE_SENDING, STATE_SENT, TICKET_EXPIRY, TICKET_GRACE, TICKET_INTERVAL,
+    TICKET_LENGTH, TICKET_RENEW,
+};
+use crate::message::{generate_peering_key, validate_peering_key, validate_pn_stamp, LXMessage};
+use crate::pn::PnDirectory;
+use rmpv::Value;
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use super::peer::{
+    decode_peer_sync_request, decode_peer_sync_response, encode_peer_sync_request,
+    encode_peer_sync_response, Peer, PeerState, PeerTable, PeeringValidation, PropagationValidation,
+    PeerSyncRequest, PeerSyncResponse, DEFAULT_PEERING_COST, DEFAULT_PROPAGATION_STAMP_COST,
+    DEFAULT_PROPAGATION_STAMP_FLEX, PEER_ERROR_INVALID_KEY, PROPAGATION_INVALID_STAMP_THROTTLE_MS,
+};
+use super::storage::{
+    clean_transient_cache, propagation_entry_from_bytes, propagation_entry_to_bytes, FailedDelivery,
+    FileMessageStore, InMemoryStore, MessageStore, NodeStats, OutboundStampCosts,
+    PropagationEntry, PropagationStore, QueuedMessage, TicketStoreSnapshot,
+};
+use super::transport::{
+    encode_request_bytes, request_id_for_destination, request_path_hash, DeliveryOutput, RnsOutbound,
+    RnsRequest, RnsResponse,
+};
+use super::{DeliveryMode, RnsCryptoPolicy, RnsError};
+use rand_core::RngCore;
+
+const DELIVERED_CACHE_MAX: usize = 2048;
+pub const PEER_SYNC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
+pub const PEER_SYNC_PATH: &str = "lxmf/peer/sync";
+pub const CONTROL_STATS_PATH: &str = "/pn/get/stats";
+pub const CONTROL_SYNC_PATH: &str = "/pn/peer/sync";
+pub const CONTROL_UNPEER_PATH: &str = "/pn/peer/unpeer";
+
+pub const CONTROL_ERROR_NO_IDENTITY: u8 = 0xf0;
+pub const CONTROL_ERROR_NO_ACCESS: u8 = 0xf1;
+pub const CONTROL_ERROR_INVALID_DATA: u8 = 0xf4;
+pub const CONTROL_ERROR_NOT_FOUND: u8 = 0xfd;
+
+#[derive(Debug, Default)]
+pub struct DeliveredCache {
+    max_entries: usize,
+    order: VecDeque<[u8; HASH_LENGTH]>,
+    seen: HashSet<[u8; HASH_LENGTH]>,
+}
+
+impl DeliveredCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            order: VecDeque::new(),
+            seen: HashSet::new(),
+        }
+    }
+
+    pub fn seen_before(&self, id: &[u8; HASH_LENGTH]) -> bool {
+        self.seen.contains(id)
+    }
+
+    pub fn mark_delivered(&mut self, id: [u8; HASH_LENGTH]) -> bool {
+        if self.seen.contains(&id) {
+            return false;
+        }
+        self.seen.insert(id);
+        self.order.push_back(id);
+        while self.order.len() > self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+
+    pub fn len(&self) -> usize {
+        self.seen.len()
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RuntimeConfig {
+    pub outbound_interval_ms: u64,
+    pub inflight_interval_ms: u64,
+    pub request_interval_ms: u64,
+    pub pn_interval_ms: u64,
+    pub store_interval_ms: u64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            outbound_interval_ms: 1000,
+            inflight_interval_ms: 1000,
+            request_interval_ms: 1000,
+            pn_interval_ms: 5000,
+            store_interval_ms: 8 * 60 * 1000,
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct RuntimeTick {
+    pub deliveries: Vec<QueuedDelivery>,
+    pub delivery_errors: Vec<String>,
+    pub inflight_failures: Vec<FailedDelivery>,
+    pub request_timeouts: Vec<[u8; DESTINATION_LENGTH]>,
+    pub peer_sync_requests: Vec<([u8; DESTINATION_LENGTH], PeerSyncRequest)>,
+    pub pn_ran: bool,
+    pub store_ran: bool,
+}
+
+pub struct LxmfRuntime {
+    router: RnsRouter,
+    requests: RnsRequestManager,
+    config: RuntimeConfig,
+    last_outbound_ms: u64,
+    last_inflight_ms: u64,
+    last_request_ms: u64,
+    last_pn_ms: u64,
+    last_store_ms: u64,
+}
+
+impl LxmfRuntime {
+    pub fn new(router: RnsRouter) -> Self {
+        Self {
+            router,
+            requests: RnsRequestManager::new(),
+            config: RuntimeConfig::default(),
+            last_outbound_ms: 0,
+            last_inflight_ms: 0,
+            last_request_ms: 0,
+            last_pn_ms: 0,
+            last_store_ms: 0,
+        }
+    }
+
+    pub fn with_config(router: RnsRouter, config: RuntimeConfig) -> Self {
+        Self {
+            router,
+            requests: RnsRequestManager::new(),
+            config,
+            last_outbound_ms: 0,
+            last_inflight_ms: 0,
+            last_request_ms: 0,
+            last_pn_ms: 0,
+            last_store_ms: 0,
+        }
+    }
+
+    pub fn router(&self) -> &RnsRouter {
+        &self.router
+    }
+
+    pub fn router_mut(&mut self) -> &mut RnsRouter {
+        &mut self.router
+    }
+
+    pub fn requests(&self) -> &RnsRequestManager {
+        &self.requests
+    }
+
+    pub fn requests_mut(&mut self) -> &mut RnsRequestManager {
+        &mut self.requests
+    }
+
+    pub fn config(&self) -> RuntimeConfig {
+        self.config
+    }
+
+    pub fn set_config(&mut self, config: RuntimeConfig) {
+        self.config = config;
+    }
+
+    pub fn tick(&mut self, now_ms: u64) -> RuntimeTick {
+        let mut tick = RuntimeTick::default();
+
+        if now_ms.saturating_sub(self.last_outbound_ms) >= self.config.outbound_interval_ms {
+            loop {
+                match self.router.next_delivery_with_retry(now_ms) {
+                    Some(Ok(delivery)) => tick.deliveries.push(delivery),
+                    Some(Err(err)) => tick.delivery_errors.push(err.to_string()),
+                    None => break,
+                }
+            }
+            self.last_outbound_ms = now_ms;
+        }
+
+        if now_ms.saturating_sub(self.last_inflight_ms) >= self.config.inflight_interval_ms {
+            tick.inflight_failures = self.router.poll_timeouts(now_ms);
+            self.last_inflight_ms = now_ms;
+        }
+
+        if now_ms.saturating_sub(self.last_request_ms) >= self.config.request_interval_ms {
+            tick.request_timeouts = self.requests.poll_timeouts(now_ms);
+            self.last_request_ms = now_ms;
+        }
+
+        if now_ms.saturating_sub(self.last_pn_ms) >= self.config.pn_interval_ms {
+            tick.pn_ran = true;
+            self.last_pn_ms = now_ms;
+        }
+
+        if now_ms.saturating_sub(self.last_store_ms) >= self.config.store_interval_ms {
+            tick.store_ran = true;
+            self.last_store_ms = now_ms;
+        }
+
+        tick
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TicketEntry {
+    expires_at_s: f64,
+    ticket: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct TicketStore {
+    outbound: HashMap<[u8; DESTINATION_LENGTH], TicketEntry>,
+    inbound: HashMap<[u8; DESTINATION_LENGTH], HashMap<Vec<u8>, f64>>,
+    last_deliveries: HashMap<[u8; DESTINATION_LENGTH], f64>,
+}
+
+impl TicketStore {
+    fn now_s(now_ms: u64) -> f64 {
+        now_ms as f64 / 1000.0
+    }
+
+    fn generate_ticket(
+        &mut self,
+        destination_hash: [u8; DESTINATION_LENGTH],
+        now_ms: u64,
+        expiry_s: u64,
+    ) -> Option<TicketEntry> {
+        let now_s = Self::now_s(now_ms);
+
+        if let Some(last_delivery) = self.last_deliveries.get(&destination_hash) {
+            if now_s - *last_delivery < TICKET_INTERVAL as f64 {
+                return None;
+            }
+        }
+
+        if let Some(entry_map) = self.inbound.get(&destination_hash) {
+            for (ticket, expires_at) in entry_map {
+                if expires_at - now_s > TICKET_RENEW as f64 {
+                    return Some(TicketEntry {
+                        expires_at_s: *expires_at,
+                        ticket: ticket.clone(),
+                    });
+                }
+            }
+        }
+
+        let mut ticket = vec![0u8; TICKET_LENGTH];
+        let mut rng = rand_core::OsRng;
+        rng.fill_bytes(&mut ticket);
+        let expires_at_s = now_s + expiry_s as f64;
+        self.inbound
+            .entry(destination_hash)
+            .or_default()
+            .insert(ticket.clone(), expires_at_s);
+
+        Some(TicketEntry {
+            expires_at_s,
+            ticket,
+        })
+    }
+
+    fn remember_ticket(&mut self, destination_hash: [u8; DESTINATION_LENGTH], entry: TicketEntry) {
+        self.outbound.insert(destination_hash, entry);
+    }
+
+    fn get_outbound_ticket(&self, destination_hash: &[u8; DESTINATION_LENGTH], now_ms: u64) -> Option<Vec<u8>> {
+        let now_s = Self::now_s(now_ms);
+        let entry = self.outbound.get(destination_hash)?;
+        if entry.expires_at_s > now_s {
+            Some(entry.ticket.clone())
+        } else {
+            None
+        }
+    }
+
+    fn get_inbound_tickets(
+        &self,
+        destination_hash: &[u8; DESTINATION_LENGTH],
+        now_ms: u64,
+    ) -> Option<Vec<Vec<u8>>> {
+        let now_s = Self::now_s(now_ms);
+        let entry_map = self.inbound.get(destination_hash)?;
+        let mut tickets = Vec::new();
+        for (ticket, expires_at) in entry_map {
+            if *expires_at > now_s {
+                tickets.push(ticket.clone());
+            }
+        }
+        if tickets.is_empty() {
+            None
+        } else {
+            Some(tickets)
+        }
+    }
+
+    fn mark_ticket_delivered(&mut self, destination_hash: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        let now_s = Self::now_s(now_ms);
+        self.last_deliveries.insert(destination_hash, now_s);
+    }
+
+    fn clean_expired(&mut self, now_ms: u64) {
+        let now_s = Self::now_s(now_ms);
+        self.outbound.retain(|_, entry| entry.expires_at_s > now_s);
+        for tickets in self.inbound.values_mut() {
+            tickets.retain(|_, expires_at| now_s <= *expires_at + TICKET_GRACE as f64);
+        }
+    }
+
+    fn snapshot(&self) -> TicketStoreSnapshot {
+        let mut outbound = HashMap::new();
+        for (dest, entry) in &self.outbound {
+            outbound.insert(*dest, (entry.expires_at_s, entry.ticket.clone()));
+        }
+        TicketStoreSnapshot {
+            outbound,
+            inbound: self.inbound.clone(),
+            last_deliveries: self.last_deliveries.clone(),
+        }
+    }
+
+    fn restore(&mut self, snapshot: TicketStoreSnapshot) {
+        self.outbound.clear();
+        for (dest, (expires_at_s, ticket)) in snapshot.outbound {
+            self.outbound.insert(
+                dest,
+                TicketEntry {
+                    expires_at_s,
+                    ticket,
+                },
+            );
+        }
+        self.inbound = snapshot.inbound;
+        self.last_deliveries = snapshot.last_deliveries;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DeferredOutbound {
+    message: LXMessage,
+    mode: DeliveryMode,
+}
+
+#[derive(Debug, Clone)]
+struct PeerSyncPending {
+    peer_id: [u8; DESTINATION_LENGTH],
+    request: PeerSyncRequest,
+}
+
+pub struct LxmfRouter {
+    runtime: LxmfRuntime,
+    peers: PeerTable,
+    static_peers: HashSet<[u8; DESTINATION_LENGTH]>,
+    ignored_destinations: HashSet<[u8; DESTINATION_LENGTH]>,
+    allowed_identities: HashSet<[u8; DESTINATION_LENGTH]>,
+    auth_required: bool,
+    pn_directory: PnDirectory,
+    propagation_store: PropagationStore,
+    propagation_store_limit_bytes: Option<u64>,
+    propagation_prioritised: HashSet<[u8; DESTINATION_LENGTH]>,
+    node_stats: NodeStats,
+    outbound_stamp_costs: HashMap<[u8; DESTINATION_LENGTH], (f64, u32)>,
+    inbound_stamp_costs: HashMap<[u8; DESTINATION_LENGTH], u32>,
+    ticket_store: TicketStore,
+    deferred_outbound: VecDeque<DeferredOutbound>,
+    peer_sync_queue: VecDeque<([u8; DESTINATION_LENGTH], PeerSyncRequest)>,
+    peer_sync_pending: HashMap<[u8; DESTINATION_LENGTH], PeerSyncPending>,
+    peer_sync_responses: VecDeque<([u8; DESTINATION_LENGTH], RnsResponse)>,
+    peer_sync_outbound: VecDeque<([u8; DESTINATION_LENGTH], RnsRequest)>,
+    control_responses: VecDeque<([u8; DESTINATION_LENGTH], RnsResponse)>,
+    control_allowed: HashSet<[u8; DESTINATION_LENGTH]>,
+    propagation_node_enabled: bool,
+    propagation_started_ms: u64,
+    delivery_transfer_limit_kb: f64,
+    propagation_transfer_limit_kb: f64,
+    propagation_sync_limit_kb: f64,
+    max_peering_cost: u32,
+    max_peers: Option<u32>,
+    autopeer_maxdepth: Option<u32>,
+    from_static_only: bool,
+    enforce_stamps: bool,
+    local_deliveries: HashMap<[u8; 32], f64>,
+    locally_processed: HashMap<[u8; 32], f64>,
+    persistence_root: Option<std::path::PathBuf>,
+    peering_validation: Option<PeeringValidation>,
+    propagation_validation: Option<PropagationValidation>,
+}
+
+impl LxmfRouter {
+    pub fn new(router: RnsRouter) -> Self {
+        let local_identity_hash = router.local_identity_hash();
+        Self {
+            runtime: LxmfRuntime::new(router),
+            peers: PeerTable::new(),
+            static_peers: HashSet::new(),
+            ignored_destinations: HashSet::new(),
+            allowed_identities: HashSet::new(),
+            auth_required: false,
+            pn_directory: PnDirectory::new(),
+            propagation_store: PropagationStore::new(),
+            propagation_store_limit_bytes: None,
+            propagation_prioritised: HashSet::new(),
+            node_stats: NodeStats::default(),
+            outbound_stamp_costs: HashMap::new(),
+            inbound_stamp_costs: HashMap::new(),
+            ticket_store: TicketStore::default(),
+            deferred_outbound: VecDeque::new(),
+            peer_sync_queue: VecDeque::new(),
+            peer_sync_pending: HashMap::new(),
+            peer_sync_responses: VecDeque::new(),
+            peer_sync_outbound: VecDeque::new(),
+            control_responses: VecDeque::new(),
+            control_allowed: HashSet::from([local_identity_hash]),
+            propagation_node_enabled: false,
+            propagation_started_ms: system_now_ms(),
+            delivery_transfer_limit_kb: 1000.0,
+            propagation_transfer_limit_kb: 256.0,
+            propagation_sync_limit_kb: 256.0 * 40.0,
+            max_peering_cost: 26,
+            max_peers: None,
+            autopeer_maxdepth: None,
+            from_static_only: false,
+            enforce_stamps: true,
+            local_deliveries: HashMap::new(),
+            locally_processed: HashMap::new(),
+            persistence_root: None,
+            peering_validation: Some(PeeringValidation {
+                local_identity_hash,
+                target_cost: DEFAULT_PEERING_COST,
+            }),
+            propagation_validation: Some(PropagationValidation {
+                stamp_cost: DEFAULT_PROPAGATION_STAMP_COST,
+                stamp_cost_flex: DEFAULT_PROPAGATION_STAMP_FLEX,
+            }),
+        }
+    }
+
+    pub fn with_config(router: RnsRouter, config: RuntimeConfig) -> Self {
+        let local_identity_hash = router.local_identity_hash();
+        Self {
+            runtime: LxmfRuntime::with_config(router, config),
+            peers: PeerTable::new(),
+            static_peers: HashSet::new(),
+            ignored_destinations: HashSet::new(),
+            allowed_identities: HashSet::new(),
+            auth_required: false,
+            pn_directory: PnDirectory::new(),
+            propagation_store: PropagationStore::new(),
+            propagation_store_limit_bytes: None,
+            propagation_prioritised: HashSet::new(),
+            node_stats: NodeStats::default(),
+            outbound_stamp_costs: HashMap::new(),
+            inbound_stamp_costs: HashMap::new(),
+            ticket_store: TicketStore::default(),
+            deferred_outbound: VecDeque::new(),
+            peer_sync_queue: VecDeque::new(),
+            peer_sync_pending: HashMap::new(),
+            peer_sync_responses: VecDeque::new(),
+            peer_sync_outbound: VecDeque::new(),
+            control_responses: VecDeque::new(),
+            control_allowed: HashSet::from([local_identity_hash]),
+            propagation_node_enabled: false,
+            propagation_started_ms: system_now_ms(),
+            delivery_transfer_limit_kb: 1000.0,
+            propagation_transfer_limit_kb: 256.0,
+            propagation_sync_limit_kb: 256.0 * 40.0,
+            max_peering_cost: 26,
+            max_peers: None,
+            autopeer_maxdepth: None,
+            from_static_only: false,
+            enforce_stamps: true,
+            local_deliveries: HashMap::new(),
+            locally_processed: HashMap::new(),
+            persistence_root: None,
+            peering_validation: Some(PeeringValidation {
+                local_identity_hash,
+                target_cost: DEFAULT_PEERING_COST,
+            }),
+            propagation_validation: Some(PropagationValidation {
+                stamp_cost: DEFAULT_PROPAGATION_STAMP_COST,
+                stamp_cost_flex: DEFAULT_PROPAGATION_STAMP_FLEX,
+            }),
+        }
+    }
+
+    pub fn with_store(
+        delivery: RnsOutbound,
+        store: Box<dyn MessageStore>,
+        config: RuntimeConfig,
+    ) -> Self {
+        let router = RnsRouter::with_store(delivery, store);
+        Self::with_config(router, config)
+    }
+
+    pub fn with_store_and_root(
+        delivery: RnsOutbound,
+        store: Box<dyn MessageStore>,
+        store_root: &std::path::Path,
+        config: RuntimeConfig,
+    ) -> Self {
+        let router = RnsRouter::with_store(delivery, store);
+        let mut facade = Self::with_config(router, config);
+        let peer_store = FileMessageStore::new(store_root);
+        facade.peers = peer_store.load_peers();
+        facade.static_peers = HashSet::new();
+        facade.ignored_destinations = HashSet::new();
+        facade.allowed_identities = HashSet::new();
+        facade.auth_required = false;
+        facade.persistence_root = Some(store_root.to_path_buf());
+        facade.restore_ticket_store(peer_store.load_available_tickets());
+        facade.outbound_stamp_costs = peer_store.load_outbound_stamp_costs().entries;
+        facade.local_deliveries = peer_store.load_local_deliveries();
+        facade.locally_processed = peer_store.load_locally_processed();
+        facade.propagation_store = peer_store.load_propagation_store();
+        facade.node_stats = peer_store.load_node_stats();
+
+        let now_ms = system_now_ms();
+        facade.clean_tickets(now_ms);
+        facade.clean_outbound_stamp_costs(now_ms);
+        facade.clean_transient_id_caches(now_ms);
+        facade.clean_propagation_store(now_ms);
+        facade.save_local_caches();
+        facade
+    }
+
+    pub fn runtime(&self) -> &LxmfRuntime {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut LxmfRuntime {
+        &mut self.runtime
+    }
+
+    pub fn peers(&self) -> &PeerTable {
+        &self.peers
+    }
+
+    pub fn peers_mut(&mut self) -> &mut PeerTable {
+        &mut self.peers
+    }
+
+    pub fn pn_directory(&self) -> &PnDirectory {
+        &self.pn_directory
+    }
+
+    pub fn pn_directory_mut(&mut self) -> &mut PnDirectory {
+        &mut self.pn_directory
+    }
+
+    pub fn propagation_store(&self) -> &PropagationStore {
+        &self.propagation_store
+    }
+
+    pub fn propagation_store_mut(&mut self) -> &mut PropagationStore {
+        &mut self.propagation_store
+    }
+
+    pub fn propagation_store_size_bytes(&self) -> usize {
+        self.propagation_store.total_size_bytes()
+    }
+
+    pub fn node_stats(&self) -> &NodeStats {
+        &self.node_stats
+    }
+
+    pub fn node_stats_mut(&mut self) -> &mut NodeStats {
+        &mut self.node_stats
+    }
+
+    pub fn enable_propagation_node(&mut self, enable: bool, now_ms: u64) {
+        self.propagation_node_enabled = enable;
+        if enable {
+            self.propagation_started_ms = now_ms;
+        }
+    }
+
+    pub fn propagation_node_enabled(&self) -> bool {
+        self.propagation_node_enabled
+    }
+
+    pub fn set_transfer_limits_kb(
+        &mut self,
+        delivery_limit_kb: f64,
+        propagation_limit_kb: f64,
+        sync_limit_kb: f64,
+    ) {
+        self.delivery_transfer_limit_kb = delivery_limit_kb.max(0.0);
+        self.propagation_transfer_limit_kb = propagation_limit_kb.max(0.0);
+        self.propagation_sync_limit_kb = sync_limit_kb.max(0.0);
+    }
+
+    pub fn transfer_limits_kb(&self) -> (f64, f64, f64) {
+        (
+            self.delivery_transfer_limit_kb,
+            self.propagation_transfer_limit_kb,
+            self.propagation_sync_limit_kb,
+        )
+    }
+
+    pub fn set_max_peers(&mut self, max_peers: Option<u32>) {
+        self.max_peers = max_peers;
+    }
+
+    pub fn max_peers(&self) -> Option<u32> {
+        self.max_peers
+    }
+
+    pub fn set_from_static_only(&mut self, from_static_only: bool) {
+        self.from_static_only = from_static_only;
+    }
+
+    pub fn from_static_only(&self) -> bool {
+        self.from_static_only
+    }
+
+    pub fn set_autopeer_maxdepth(&mut self, maxdepth: Option<u32>) {
+        self.autopeer_maxdepth = maxdepth;
+    }
+
+    pub fn autopeer_maxdepth(&self) -> Option<u32> {
+        self.autopeer_maxdepth
+    }
+
+    pub fn set_max_peering_cost(&mut self, max_cost: u32) {
+        self.max_peering_cost = max_cost;
+    }
+
+    pub fn max_peering_cost(&self) -> u32 {
+        self.max_peering_cost
+    }
+
+    pub fn set_static_peers(&mut self, peers: Vec<[u8; DESTINATION_LENGTH]>) {
+        self.static_peers = peers.into_iter().collect();
+    }
+
+    pub fn static_peers_len(&self) -> usize {
+        self.static_peers.len()
+    }
+
+    pub fn allow_control(&mut self, identity_hash: [u8; DESTINATION_LENGTH]) {
+        self.control_allowed.insert(identity_hash);
+    }
+
+    pub fn set_control_allowed(&mut self, allowed: Vec<[u8; DESTINATION_LENGTH]>) {
+        self.control_allowed = allowed.into_iter().collect();
+    }
+
+    pub fn control_allowed_len(&self) -> usize {
+        self.control_allowed.len()
+    }
+
+    pub fn set_message_storage_limit(
+        &mut self,
+        kilobytes: Option<u64>,
+        megabytes: Option<u64>,
+        gigabytes: Option<u64>,
+    ) {
+        let mut limit_bytes = 0u64;
+        if let Some(kb) = kilobytes {
+            limit_bytes = limit_bytes.saturating_add(kb.saturating_mul(1000));
+        }
+        if let Some(mb) = megabytes {
+            limit_bytes = limit_bytes.saturating_add(mb.saturating_mul(1000 * 1000));
+        }
+        if let Some(gb) = gigabytes {
+            limit_bytes = limit_bytes.saturating_add(gb.saturating_mul(1000 * 1000 * 1000));
+        }
+        self.propagation_store_limit_bytes = if limit_bytes == 0 {
+            None
+        } else {
+            Some(limit_bytes)
+        };
+    }
+
+    pub fn message_storage_limit_bytes(&self) -> Option<u64> {
+        self.propagation_store_limit_bytes
+    }
+
+    pub fn prioritise_destination(&mut self, destination_hash: [u8; DESTINATION_LENGTH]) {
+        self.propagation_prioritised.insert(destination_hash);
+    }
+
+    pub fn unprioritise_destination(&mut self, destination_hash: &[u8; DESTINATION_LENGTH]) {
+        self.propagation_prioritised.remove(destination_hash);
+    }
+
+    pub fn set_enforce_stamps(&mut self, enforce: bool) {
+        self.enforce_stamps = enforce;
+    }
+
+    pub fn set_authentication(&mut self, required: bool) {
+        self.auth_required = required;
+    }
+
+    pub fn auth_required(&self) -> bool {
+        self.auth_required
+    }
+
+    pub fn set_allowed_identities(&mut self, allowed: Vec<[u8; DESTINATION_LENGTH]>) {
+        self.allowed_identities = allowed.into_iter().collect();
+    }
+
+    pub fn allow_identity(&mut self, identity_hash: [u8; DESTINATION_LENGTH]) {
+        self.allowed_identities.insert(identity_hash);
+    }
+
+    pub fn allowed_identities_len(&self) -> usize {
+        self.allowed_identities.len()
+    }
+
+    pub fn ignore_destination(&mut self, destination_hash: [u8; DESTINATION_LENGTH]) {
+        self.ignored_destinations.insert(destination_hash);
+    }
+
+    pub fn unignore_destination(&mut self, destination_hash: &[u8; DESTINATION_LENGTH]) {
+        self.ignored_destinations.remove(destination_hash);
+    }
+
+    pub fn set_persistence_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.persistence_root = root;
+    }
+
+    pub fn set_outbound_stamp_cost(
+        &mut self,
+        destination_hash: [u8; DESTINATION_LENGTH],
+        stamp_cost: Option<u32>,
+        now_ms: u64,
+    ) {
+        if let Some(cost) = stamp_cost {
+            if cost > 0 {
+                let now_s = TicketStore::now_s(now_ms);
+                self.outbound_stamp_costs.insert(destination_hash, (now_s, cost));
+                self.persist_outbound_stamp_costs();
+                return;
+            }
+        }
+        self.outbound_stamp_costs.remove(&destination_hash);
+        self.persist_outbound_stamp_costs();
+    }
+
+    pub fn set_inbound_stamp_cost(
+        &mut self,
+        destination_hash: [u8; DESTINATION_LENGTH],
+        stamp_cost: Option<u32>,
+    ) {
+        if let Some(cost) = stamp_cost {
+            if cost > 0 {
+                self.inbound_stamp_costs.insert(destination_hash, cost);
+                return;
+            }
+        }
+        self.inbound_stamp_costs.remove(&destination_hash);
+    }
+
+    pub fn clean_outbound_stamp_costs(&mut self, now_ms: u64) -> usize {
+        const STAMP_COST_EXPIRY_S: u64 = 45 * 24 * 60 * 60;
+        let now_s = TicketStore::now_s(now_ms);
+        let before = self.outbound_stamp_costs.len();
+        self.outbound_stamp_costs
+            .retain(|_, (updated_at, _)| now_s <= *updated_at + STAMP_COST_EXPIRY_S as f64);
+        let removed = before.saturating_sub(self.outbound_stamp_costs.len());
+        if removed > 0 {
+            self.persist_outbound_stamp_costs();
+        }
+        removed
+    }
+
+    pub fn get_outbound_stamp_cost(
+        &self,
+        destination_hash: &[u8; DESTINATION_LENGTH],
+    ) -> Option<u32> {
+        self.outbound_stamp_costs
+            .get(destination_hash)
+            .map(|(_, cost)| *cost)
+    }
+
+    pub fn deferred_len(&self) -> usize {
+        self.deferred_outbound.len()
+    }
+
+    pub fn local_deliveries_len(&self) -> usize {
+        self.local_deliveries.len()
+    }
+
+    pub fn locally_processed_len(&self) -> usize {
+        self.locally_processed.len()
+    }
+
+    pub fn mark_local_delivery(&mut self, transient_id: [u8; 32], now_ms: u64) {
+        let now_s = TicketStore::now_s(now_ms);
+        self.local_deliveries.insert(transient_id, now_s);
+        self.save_local_caches();
+    }
+
+    pub fn mark_locally_processed(&mut self, transient_id: [u8; 32], now_ms: u64) {
+        let now_s = TicketStore::now_s(now_ms);
+        self.locally_processed.insert(transient_id, now_s);
+        self.save_local_caches();
+    }
+
+    pub fn process_deferred_stamps(&mut self, _now_ms: u64, max_items: usize) -> usize {
+        let mut processed = 0;
+        for _ in 0..max_items {
+            let Some(mut item) = self.deferred_outbound.pop_front() else {
+                break;
+            };
+            item.message.defer_stamp = false;
+            self.runtime.router_mut().enqueue(item.message, item.mode);
+            processed += 1;
+        }
+        processed
+    }
+
+    pub fn handle_outbound(
+        &mut self,
+        mut message: LXMessage,
+        mode: DeliveryMode,
+        now_ms: u64,
+    ) -> Option<u64> {
+        if message.stamp_cost.is_none() {
+            if let Some(cost) = self.get_outbound_stamp_cost(&message.destination_hash) {
+                message.stamp_cost = Some(cost);
+            }
+        }
+
+        message.outbound_ticket = self
+            .ticket_store
+            .get_outbound_ticket(&message.destination_hash, now_ms);
+
+        if message.outbound_ticket.is_some() && message.defer_stamp {
+            message.defer_stamp = false;
+        }
+
+        if message.include_ticket {
+            if let Some(entry) =
+                self.ticket_store
+                    .generate_ticket(message.destination_hash, now_ms, TICKET_EXPIRY)
+            {
+                insert_ticket_field(&mut message.fields, entry.expires_at_s, &entry.ticket);
+                self.persist_ticket_store();
+            }
+        }
+
+        if message.defer_stamp && message.stamp_cost.is_none() {
+            message.defer_stamp = false;
+        }
+
+        if message.defer_stamp {
+            self.deferred_outbound.push_back(DeferredOutbound { message, mode });
+            None
+        } else {
+            Some(self.runtime.router_mut().enqueue(message, mode))
+        }
+    }
+
+    pub fn generate_ticket(
+        &mut self,
+        destination_hash: [u8; DESTINATION_LENGTH],
+        now_ms: u64,
+    ) -> Option<(f64, Vec<u8>)> {
+        let entry = self.ticket_store
+            .generate_ticket(destination_hash, now_ms, TICKET_EXPIRY)
+            .map(|entry| (entry.expires_at_s, entry.ticket));
+        if entry.is_some() {
+            self.persist_ticket_store();
+        }
+        entry
+    }
+
+    pub fn remember_ticket(
+        &mut self,
+        destination_hash: [u8; DESTINATION_LENGTH],
+        expires_at_s: f64,
+        ticket: Vec<u8>,
+    ) {
+        self.ticket_store.remember_ticket(
+            destination_hash,
+            TicketEntry {
+                expires_at_s,
+                ticket,
+            },
+        );
+        self.persist_ticket_store();
+    }
+
+    pub fn get_outbound_ticket(
+        &self,
+        destination_hash: &[u8; DESTINATION_LENGTH],
+        now_ms: u64,
+    ) -> Option<Vec<u8>> {
+        self.ticket_store.get_outbound_ticket(destination_hash, now_ms)
+    }
+
+    pub fn mark_ticket_delivered(&mut self, destination_hash: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        self.ticket_store.mark_ticket_delivered(destination_hash, now_ms);
+        self.persist_ticket_store();
+    }
+
+    pub fn clean_tickets(&mut self, now_ms: u64) {
+        self.ticket_store.clean_expired(now_ms);
+        self.persist_ticket_store();
+    }
+
+    pub fn clean_transient_id_caches(&mut self, now_ms: u64) -> usize {
+        let now_s = TicketStore::now_s(now_ms);
+        let removed_delivered = clean_transient_cache(&mut self.local_deliveries, now_s);
+        let removed_processed = clean_transient_cache(&mut self.locally_processed, now_s);
+        let removed = removed_delivered.saturating_add(removed_processed);
+        if removed > 0 {
+            self.save_local_caches();
+        }
+        removed
+    }
+
+    pub fn clean_propagation_store(&mut self, now_ms: u64) -> usize {
+        let now_s = TicketStore::now_s(now_ms);
+        let mut removed_ids = Vec::new();
+        let expiry_s = MESSAGE_EXPIRY as f64;
+        for (id, entry) in self.propagation_store.entries() {
+            if !entry.timestamp.is_finite() || entry.timestamp <= 0.0 || now_s > entry.timestamp + expiry_s {
+                removed_ids.push(*id);
+            }
+        }
+
+        for id in &removed_ids {
+            if let Some(entry) = self.propagation_store.get(id) {
+                self.remove_propagation_entry_exact(entry);
+            }
+            self.propagation_store.remove(id);
+        }
+
+        if let Some(limit_bytes) = self.propagation_store_limit_bytes {
+            let total_bytes = self.propagation_store.total_size_bytes();
+            if total_bytes > limit_bytes as usize {
+                let bytes_needed = total_bytes - limit_bytes as usize;
+                let mut weighted: Vec<(f64, [u8; 32], usize)> = Vec::new();
+                for (id, entry) in self.propagation_store.entries() {
+                    let size = entry.lxm_data.len();
+                    let age_days = (now_s - entry.timestamp).max(0.0) / 60.0 / 60.0 / 24.0;
+                    let age_weight = (age_days / 4.0).max(1.0);
+                    let priority_weight = if entry
+                        .lxm_data
+                        .get(..DESTINATION_LENGTH)
+                        .and_then(|bytes| {
+                            if bytes.len() == DESTINATION_LENGTH {
+                                let mut out = [0u8; DESTINATION_LENGTH];
+                                out.copy_from_slice(bytes);
+                                Some(out)
+                            } else {
+                                None
+                            }
+                        })
+                        .map(|dest| self.propagation_prioritised.contains(&dest))
+                        .unwrap_or(false)
+                    {
+                        0.1
+                    } else {
+                        1.0
+                    };
+                    let weight = priority_weight * age_weight * size as f64;
+                    weighted.push((weight, *id, size));
+                }
+                weighted.sort_by(|a, b| {
+                    b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                });
+
+                let mut cleaned_bytes = 0usize;
+                for (_, id, size) in weighted {
+                    if cleaned_bytes >= bytes_needed {
+                        break;
+                    }
+                    if let Some(entry) = self.propagation_store.get(&id).cloned() {
+                        self.remove_propagation_entry_exact(&entry);
+                        self.propagation_store.remove(&id);
+                        cleaned_bytes = cleaned_bytes.saturating_add(size);
+                        removed_ids.push(id);
+                    }
+                }
+            }
+        }
+
+        removed_ids.len()
+    }
+
+    pub fn process_inbound_message(
+        &mut self,
+        mut message: LXMessage,
+        now_ms: u64,
+        signature_validated: bool,
+        no_stamp_enforcement: bool,
+    ) -> Option<LXMessage> {
+        if self.ignored_destinations.contains(&message.source_hash) {
+            return None;
+        }
+        if let Some(message_id) = message.message_id {
+            if self.local_deliveries.contains_key(&message_id) {
+                return None;
+            }
+        }
+
+        if signature_validated {
+            if let Some((expires_at_s, ticket)) = extract_ticket_field(&message.fields) {
+                if expires_at_s > TicketStore::now_s(now_ms) {
+                    self.remember_ticket(message.source_hash, expires_at_s, ticket);
+                }
+            }
+        }
+
+        if let Some(required_cost) = self.inbound_stamp_costs.get(&message.destination_hash).copied() {
+            let tickets = self
+                .ticket_store
+                .get_inbound_tickets(&message.source_hash, now_ms);
+            let valid = validate_stamp_with_tickets(&mut message, required_cost, tickets.as_ref());
+            if !valid && self.enforce_stamps && !no_stamp_enforcement {
+                return None;
+            }
+        }
+
+        if let Some(message_id) = message.message_id {
+            self.mark_local_delivery(message_id, now_ms);
+        }
+        Some(message)
+    }
+
+    pub fn process_propagated(
+        &mut self,
+        timestamp: f64,
+        lxm_data: Vec<u8>,
+        now_ms: u64,
+        source_hash: Option<[u8; DESTINATION_LENGTH]>,
+        count_client_receive: bool,
+    ) -> Option<[u8; 32]> {
+        let mut entry = PropagationEntry {
+            transient_id: crate::rns::full_hash(&lxm_data),
+            lxm_data: lxm_data.clone(),
+            timestamp,
+        };
+
+        if let Some(validation) = self.propagation_validation {
+            let min_cost = validation.stamp_cost.saturating_sub(validation.stamp_cost_flex);
+            if let Some((transient_id, lxm_unstamped, _value, stamp)) =
+                validate_pn_stamp(&lxm_data, min_cost)
+            {
+                entry.transient_id = transient_id;
+                let mut stamped = Vec::with_capacity(lxm_unstamped.len() + stamp.len());
+                stamped.extend_from_slice(&lxm_unstamped);
+                stamped.extend_from_slice(&stamp);
+                entry.lxm_data = stamped;
+            } else {
+                return None;
+            }
+        }
+
+        if self.propagation_store.has(&entry.transient_id)
+            || self.locally_processed.contains_key(&entry.transient_id)
+        {
+            return None;
+        }
+
+        if count_client_receive {
+            self.node_stats.client_propagation_messages_received = self
+                .node_stats
+                .client_propagation_messages_received
+                .saturating_add(1);
+        } else if let Some(source_hash) = source_hash {
+            if !self.peers.entries().contains_key(&source_hash) {
+                self.node_stats.unpeered_propagation_incoming = self
+                    .node_stats
+                    .unpeered_propagation_incoming
+                    .saturating_add(1);
+                self.node_stats.unpeered_propagation_rx_bytes = self
+                    .node_stats
+                    .unpeered_propagation_rx_bytes
+                    .saturating_add(entry.lxm_data.len() as u64);
+            }
+        }
+
+        self.propagation_store.insert(entry.clone());
+        self.persist_propagation_entry(&entry);
+        self.mark_locally_processed(entry.transient_id, now_ms);
+        Some(entry.transient_id)
+    }
+
+    pub fn process_propagation_resource(
+        &mut self,
+        remote_hash: Option<[u8; DESTINATION_LENGTH]>,
+        peering_key: Option<&[u8]>,
+        messages: &[Vec<u8>],
+        transfer_limit_kb: Option<f64>,
+        now_ms: u64,
+    ) -> Vec<[u8; 32]> {
+        if messages.is_empty() {
+            return Vec::new();
+        }
+
+        if self.auth_required {
+            let allowed = remote_hash
+                .map(|hash| self.allowed_identities.contains(&hash))
+                .unwrap_or(false);
+            if !allowed {
+                return Vec::new();
+            }
+        }
+
+        if messages.len() > 1 && remote_hash.is_none() {
+            return Vec::new();
+        }
+
+        if let Some(limit_kb) = transfer_limit_kb {
+            let limit_bytes = (limit_kb * 1000.0) as usize;
+            let total_bytes: usize = messages.iter().map(|msg| msg.len()).sum();
+            if total_bytes > limit_bytes {
+                return Vec::new();
+            }
+        }
+
+        if messages.len() > 1 {
+            if let (Some(validation), Some(remote_hash)) = (self.peering_validation, remote_hash) {
+                let mut peering_id = Vec::with_capacity(DESTINATION_LENGTH * 2);
+                peering_id.extend_from_slice(&validation.local_identity_hash);
+                peering_id.extend_from_slice(&remote_hash);
+                let valid = peering_key
+                    .map(|key| validate_peering_key(&peering_id, key, validation.target_cost))
+                    .unwrap_or(false);
+                if !valid {
+                    let peer = self.peers.upsert(remote_hash, now_ms);
+                    peer.on_failure(now_ms);
+                    return Vec::new();
+                }
+            }
+        }
+
+        let timestamp = now_ms as f64 / 1000.0;
+        let count_client_receive = remote_hash.is_none();
+        let mut accepted = Vec::new();
+        for msg in messages {
+            if let Some(id) = self.process_propagated(
+                timestamp,
+                msg.clone(),
+                now_ms,
+                remote_hash,
+                count_client_receive,
+            ) {
+                accepted.push(id);
+            }
+        }
+        accepted
+    }
+
+    pub fn handle_propagation_resource_payload(
+        &mut self,
+        remote_hash: Option<[u8; DESTINATION_LENGTH]>,
+        peering_key: Option<&[u8]>,
+        transfer_limit_kb: Option<f64>,
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<[u8; 32]>, RnsError> {
+        let messages = super::transport::decode_propagation_resource_payload(payload)?;
+        Ok(self.process_propagation_resource(
+            remote_hash,
+            peering_key,
+            &messages,
+            transfer_limit_kb,
+            now_ms,
+        ))
+    }
+
+    pub fn process_inbound_queue(
+        &mut self,
+        now_ms: u64,
+        signature_validated: bool,
+    ) -> Vec<LXMessage> {
+        let mut accepted = Vec::new();
+        while let Some(received) = self.runtime.router_mut().pop_inbound() {
+            match received {
+                super::transport::Received::Message(message) => {
+                    if let Some(msg) =
+                        self.process_inbound_message(message, now_ms, signature_validated, false)
+                    {
+                        accepted.push(msg);
+                    }
+                }
+                super::transport::Received::Propagated {
+                    timestamp,
+                    lxm_data,
+                    source_hash,
+                    count_client_receive,
+                    ..
+                } => {
+                    let _ =
+                        self.process_propagated(timestamp, lxm_data, now_ms, source_hash, count_client_receive);
+                }
+                super::transport::Received::PropagationResource { payload, source_hash } => {
+                    let _ = self.handle_propagation_resource_payload(
+                        source_hash,
+                        None,
+                        None,
+                        &payload,
+                        now_ms,
+                    );
+                }
+                super::transport::Received::Request { request, source_hash } => {
+                    if request.path_hash == super::transport::request_path_hash(PEER_SYNC_PATH) {
+                        if let Some(peer_id) = source_hash {
+                            if let Ok(response) =
+                                self.handle_peer_sync_request(peer_id, &request, now_ms)
+                            {
+                                self.peer_sync_responses.push_back((peer_id, response));
+                            }
+                        }
+                    } else if self.propagation_node_enabled {
+                        if let Some(peer_id) = source_hash {
+                            if let Some(response) =
+                                self.handle_control_request(peer_id, &request, now_ms)
+                            {
+                                self.control_responses.push_back((peer_id, response));
+                            }
+                        }
+                    }
+                }
+                super::transport::Received::ControlRequest { request, source_hash } => {
+                    if self.propagation_node_enabled {
+                        if let Some(peer_id) = source_hash {
+                            if let Some(response) =
+                                self.handle_control_request(peer_id, &request, now_ms)
+                            {
+                                self.control_responses.push_back((peer_id, response));
+                            }
+                        } else {
+                            let response =
+                                self.control_error_response(request.request_id, CONTROL_ERROR_NO_IDENTITY);
+                            self.control_responses.push_back(([0u8; DESTINATION_LENGTH], response));
+                        }
+                    }
+                }
+                super::transport::Received::Response { response, .. } => {
+                    if let Some(payload) = super::value_to_bytes(&response.data) {
+                        if let Ok(Some((peer_id, next))) =
+                            self.handle_peer_sync_response_bytes_with_peer(
+                                response.request_id,
+                                &payload,
+                                now_ms,
+                            )
+                        {
+                            self.peer_sync_outbound.push_back((peer_id, next));
+                        }
+                    }
+                }
+            }
+        }
+        accepted
+    }
+
+    fn restore_ticket_store(&mut self, snapshot: TicketStoreSnapshot) {
+        self.ticket_store.restore(snapshot);
+    }
+
+    fn persist_ticket_store(&self) {
+        let Some(root) = &self.persistence_root else { return };
+        let store = FileMessageStore::new(root);
+        store.save_available_tickets(&self.ticket_store.snapshot());
+    }
+
+    fn persist_outbound_stamp_costs(&self) {
+        let Some(root) = &self.persistence_root else { return };
+        let store = FileMessageStore::new(root);
+        store.save_outbound_stamp_costs(&OutboundStampCosts {
+            entries: self.outbound_stamp_costs.clone(),
+        });
+    }
+
+    fn save_node_stats(&self) {
+        let Some(root) = &self.persistence_root else { return };
+        let store = FileMessageStore::new(root);
+        store.save_node_stats(&self.node_stats);
+    }
+
+    fn persist_propagation_entry(&self, entry: &PropagationEntry) {
+        let Some(root) = &self.persistence_root else { return };
+        let store = FileMessageStore::new(root);
+        store.save_propagation_entry(entry);
+    }
+
+    fn remove_propagation_entry_exact(&self, entry: &PropagationEntry) {
+        let Some(root) = &self.persistence_root else { return };
+        let store = FileMessageStore::new(root);
+        if let Some(filename) = self.propagation_store.filename(&entry.transient_id) {
+            store.remove_propagation_entry_named(filename);
+        } else {
+            store.remove_propagation_entry(&entry.transient_id);
+        }
+    }
+
+    fn save_local_caches(&self) {
+        let Some(root) = &self.persistence_root else { return };
+        let store = FileMessageStore::new(root);
+        store.save_local_deliveries(&self.local_deliveries);
+        store.save_locally_processed(&self.locally_processed);
+    }
+
+    pub fn set_peering_validation(
+        &mut self,
+        local_identity_hash: [u8; DESTINATION_LENGTH],
+        target_cost: u32,
+    ) {
+        self.peering_validation = Some(PeeringValidation {
+            local_identity_hash,
+            target_cost,
+        });
+    }
+
+    pub fn clear_peering_validation(&mut self) {
+        self.peering_validation = None;
+    }
+
+    pub fn set_propagation_validation(&mut self, stamp_cost: u32, stamp_cost_flex: u32) {
+        self.propagation_validation = Some(PropagationValidation {
+            stamp_cost,
+            stamp_cost_flex,
+        });
+    }
+
+    pub fn clear_propagation_validation(&mut self) {
+        self.propagation_validation = None;
+    }
+
+    pub fn cleanup_propagation(&mut self, now_ms: u64, max_age_ms: u64) -> usize {
+        self.propagation_store.remove_older_than(now_ms, max_age_ms)
+    }
+
+    pub fn upsert_peer(&mut self, id: [u8; DESTINATION_LENGTH], now_ms: u64) -> &mut Peer {
+        self.peers.upsert(id, now_ms)
+    }
+
+    pub fn save_peers(&self, store_root: &std::path::Path) {
+        let store = FileMessageStore::new(store_root);
+        for peer in self.peers.entries().values() {
+            store.save_peer(peer);
+        }
+    }
+
+    pub fn next_peer_ready(&self, now_ms: u64) -> Option<[u8; DESTINATION_LENGTH]> {
+        self.peers.next_ready(now_ms)
+    }
+
+    pub fn pop_peer_sync_request(
+        &mut self,
+    ) -> Option<([u8; DESTINATION_LENGTH], PeerSyncRequest)> {
+        self.peer_sync_queue.pop_front()
+    }
+
+    pub fn pop_peer_sync_response(
+        &mut self,
+    ) -> Option<([u8; DESTINATION_LENGTH], RnsResponse)> {
+        self.peer_sync_responses.pop_front()
+    }
+
+    pub fn pop_peer_sync_outbound(
+        &mut self,
+    ) -> Option<([u8; DESTINATION_LENGTH], RnsRequest)> {
+        self.peer_sync_outbound.pop_front()
+    }
+
+    pub fn pop_control_response(
+        &mut self,
+    ) -> Option<([u8; DESTINATION_LENGTH], RnsResponse)> {
+        self.control_responses.pop_front()
+    }
+
+    pub fn dispatch_peer_sync_requests(
+        &mut self,
+        tick: &RuntimeTick,
+        now_ms: u64,
+    ) -> Vec<(RnsRequest, [u8; DESTINATION_LENGTH])> {
+        let mut out = Vec::new();
+        for (peer_id, req) in &tick.peer_sync_requests {
+            if let Ok(request) = self.build_peer_sync_request(*peer_id, req.clone(), now_ms) {
+                out.push((request, *peer_id));
+            }
+        }
+        out
+    }
+
+    pub fn build_peer_sync_request(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        req: PeerSyncRequest,
+        now_ms: u64,
+    ) -> Result<RnsRequest, RnsError> {
+        let bytes = encode_peer_sync_request(&req)?;
+        let request = self.runtime.requests_mut().register_request(
+            peer_id,
+            Some(PEER_SYNC_PATH.to_string()),
+            Value::Binary(bytes),
+            now_ms,
+            PEER_SYNC_TIMEOUT_MS,
+        )?;
+        self.peer_sync_pending.insert(
+            request.request_id,
+            PeerSyncPending {
+                peer_id,
+                request: req,
+            },
+        );
+        Ok(request)
+    }
+
+    pub fn handle_peer_sync_request_bytes(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Vec<u8>, RnsError> {
+        self.peers.upsert(peer_id, now_ms).mark_heard(now_ms);
+        let req = decode_peer_sync_request(payload)?;
+        let response = match req {
+            PeerSyncRequest::Offer { .. } => {
+                let response = self.handle_peer_sync_offer(peer_id, &req, now_ms);
+                if let Some(msg_get) =
+                    self.peer_sync_message_get(peer_id, &response, None, now_ms)
+                {
+                    self.peer_sync_queue.push_back((peer_id, msg_get));
+                }
+                response
+            }
+            PeerSyncRequest::MessageGetList | PeerSyncRequest::MessageGet { .. } => {
+                self.handle_peer_sync_message_get(peer_id, &req, now_ms)
+            }
+            PeerSyncRequest::MessageAck { .. } => self.handle_peer_sync_ack(peer_id, &req, now_ms),
+        };
+        encode_peer_sync_response(&response)
+    }
+
+    pub fn handle_peer_sync_request(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        req: &RnsRequest,
+        now_ms: u64,
+    ) -> Result<RnsResponse, RnsError> {
+        let payload = super::value_to_bytes(&req.data)
+            .ok_or_else(|| RnsError::Msgpack("peer sync request data must be binary".to_string()))?;
+        let response_bytes = self.handle_peer_sync_request_bytes(peer_id, &payload, now_ms)?;
+        Ok(RnsResponse {
+            request_id: req.request_id,
+            data: Value::Binary(response_bytes),
+        })
+    }
+
+    pub fn handle_peer_sync_response_bytes(
+        &mut self,
+        request_id: [u8; DESTINATION_LENGTH],
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<RnsRequest>, RnsError> {
+        if let Some(pending) = self.peer_sync_pending.get(&request_id) {
+            self.peers
+                .upsert(pending.peer_id, now_ms)
+                .mark_heard(now_ms);
+        }
+        let next = self.handle_peer_sync_response_bytes_with_peer(request_id, payload, now_ms)?;
+        Ok(next.map(|(_, req)| req))
+    }
+
+    pub fn handle_peer_sync_response(
+        &mut self,
+        resp: &RnsResponse,
+        now_ms: u64,
+    ) -> Result<Option<RnsRequest>, RnsError> {
+        let payload = super::value_to_bytes(&resp.data)
+            .ok_or_else(|| RnsError::Msgpack("peer sync response data must be binary".to_string()))?;
+        self.handle_peer_sync_response_bytes(resp.request_id, &payload, now_ms)
+    }
+
+    fn control_error_response(
+        &self,
+        request_id: [u8; DESTINATION_LENGTH],
+        code: u8,
+    ) -> RnsResponse {
+        RnsResponse {
+            request_id,
+            data: Value::from(code as i64),
+        }
+    }
+
+    fn handle_control_request(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        req: &RnsRequest,
+        now_ms: u64,
+    ) -> Option<RnsResponse> {
+        if !self.control_allowed.contains(&peer_id) {
+            return Some(self.control_error_response(req.request_id, CONTROL_ERROR_NO_ACCESS));
+        }
+
+        let stats_path = super::transport::request_path_hash(CONTROL_STATS_PATH);
+        let sync_path = super::transport::request_path_hash(CONTROL_SYNC_PATH);
+        let unpeer_path = super::transport::request_path_hash(CONTROL_UNPEER_PATH);
+
+        if req.path_hash == stats_path {
+            let stats = self.compile_stats(now_ms);
+            return Some(RnsResponse {
+                request_id: req.request_id,
+                data: stats,
+            });
+        }
+
+        if req.path_hash == sync_path {
+            let Some(target) = super::value_to_fixed_bytes::<DESTINATION_LENGTH>(&req.data) else {
+                return Some(self.control_error_response(req.request_id, CONTROL_ERROR_INVALID_DATA));
+            };
+            if self.request_peer_sync(target, now_ms) {
+                return Some(RnsResponse {
+                    request_id: req.request_id,
+                    data: Value::Boolean(true),
+                });
+            }
+            return Some(self.control_error_response(req.request_id, CONTROL_ERROR_NOT_FOUND));
+        }
+
+        if req.path_hash == unpeer_path {
+            let Some(target) = super::value_to_fixed_bytes::<DESTINATION_LENGTH>(&req.data) else {
+                return Some(self.control_error_response(req.request_id, CONTROL_ERROR_INVALID_DATA));
+            };
+            if self.unpeer(target) {
+                return Some(RnsResponse {
+                    request_id: req.request_id,
+                    data: Value::Boolean(true),
+                });
+            }
+            return Some(self.control_error_response(req.request_id, CONTROL_ERROR_NOT_FOUND));
+        }
+
+        None
+    }
+
+    fn handle_peer_sync_response_bytes_with_peer(
+        &mut self,
+        request_id: [u8; DESTINATION_LENGTH],
+        payload: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<([u8; DESTINATION_LENGTH], RnsRequest)>, RnsError> {
+        let pending = match self.peer_sync_pending.remove(&request_id) {
+            Some(pending) => pending,
+            None => return Ok(None),
+        };
+        let response = decode_peer_sync_response(payload)?;
+        match pending.request {
+            PeerSyncRequest::Offer { .. } => {
+                self.apply_peer_sync_response(pending.peer_id, &response, now_ms);
+            }
+            PeerSyncRequest::MessageGet { .. } | PeerSyncRequest::MessageGetList => {
+                if let Some(ack_req) =
+                    self.apply_peer_sync_payload(pending.peer_id, &response, now_ms)
+                {
+                    let req = self.build_peer_sync_request(pending.peer_id, ack_req, now_ms)?;
+                    return Ok(Some((pending.peer_id, req)));
+                }
+            }
+            PeerSyncRequest::MessageAck { .. } => {
+                let peer = self.peers.upsert(pending.peer_id, now_ms);
+                match response {
+                    PeerSyncResponse::Bool(true) => {
+                        peer.on_payload_complete(now_ms);
+                    }
+                    _ => {
+                        peer.on_failure(now_ms);
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn peer_sync_offer(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        peering_key: Vec<u8>,
+        now_ms: u64,
+    ) -> PeerSyncRequest {
+        let available = self.propagation_store.list_ids();
+        let peer = self.peers.upsert(peer_id, now_ms);
+        peer.on_offer_sent(now_ms);
+        peer.messages_offered = peer.messages_offered.saturating_add(available.len() as u64);
+        peer.peering_key = Some(peering_key.clone());
+        PeerSyncRequest::Offer {
+            peering_key,
+            available,
+        }
+    }
+
+    fn peering_id_for_peer(&self, peer_id: [u8; DESTINATION_LENGTH]) -> Option<[u8; HASH_LENGTH]> {
+        let validation = self.peering_validation?;
+        let mut peering_id = [0u8; HASH_LENGTH];
+        peering_id[..DESTINATION_LENGTH].copy_from_slice(&validation.local_identity_hash);
+        peering_id[DESTINATION_LENGTH..].copy_from_slice(&peer_id);
+        Some(peering_id)
+    }
+
+    fn peering_key_for_peer(&self, peer_id: [u8; DESTINATION_LENGTH]) -> Vec<u8> {
+        let Some(validation) = self.peering_validation else {
+            return Vec::new();
+        };
+        let Some(peering_id) = self.peering_id_for_peer(peer_id) else {
+            return Vec::new();
+        };
+        generate_peering_key(&peering_id, validation.target_cost).unwrap_or_default()
+    }
+
+    fn schedule_peer_sync(&mut self, now_ms: u64) {
+        let Some(peer_id) = self.next_peer_ready(now_ms) else {
+            return;
+        };
+        let peering_key = self.peering_key_for_peer(peer_id);
+        let req = self.peer_sync_offer(peer_id, peering_key, now_ms);
+        self.peer_sync_queue.push_back((peer_id, req));
+    }
+
+    fn poll_peer_sync_timeouts(&mut self, now_ms: u64) {
+        for peer in self.peers.entries_mut().values_mut() {
+            if matches!(peer.state, PeerState::OfferSent | PeerState::AwaitingPayload)
+                && now_ms.saturating_sub(peer.last_attempt_ms) >= PEER_SYNC_TIMEOUT_MS
+            {
+                peer.on_timeout(now_ms);
+            }
+        }
+    }
+
+    fn handle_request_timeouts(&mut self, timeouts: &[[u8; DESTINATION_LENGTH]], now_ms: u64) {
+        for request_id in timeouts {
+            if let Some(pending) = self.peer_sync_pending.remove(request_id) {
+                let peer = self.peers.upsert(pending.peer_id, now_ms);
+                peer.on_timeout(now_ms);
+            }
+        }
+    }
+
+    pub fn handle_peer_sync_offer(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        req: &PeerSyncRequest,
+        now_ms: u64,
+    ) -> PeerSyncResponse {
+        let (peering_key, available, wants) = match req {
+            PeerSyncRequest::Offer { peering_key, available } => {
+                let wants: Vec<[u8; 32]> = available
+                    .iter()
+                    .filter(|id| !self.propagation_store.has(id))
+                    .copied()
+                    .collect();
+                (peering_key, available, wants)
+            }
+            _ => return PeerSyncResponse::Error(0x01),
+        };
+
+        if let Some(validation) = self.peering_validation {
+            let mut peering_id = Vec::with_capacity(DESTINATION_LENGTH * 2);
+            peering_id.extend_from_slice(&validation.local_identity_hash);
+            peering_id.extend_from_slice(&peer_id);
+            if !validate_peering_key(&peering_id, peering_key, validation.target_cost) {
+                let peer = self.peers.upsert(peer_id, now_ms);
+                peer.on_failure(now_ms);
+                return PeerSyncResponse::Error(PEER_ERROR_INVALID_KEY);
+            }
+        }
+
+        let peer = self.peers.upsert(peer_id, now_ms);
+        peer.last_attempt_ms = now_ms;
+        peer.state = if wants.is_empty() {
+            PeerState::Idle
+        } else {
+            PeerState::AwaitingPayload
+        };
+
+        if wants.is_empty() {
+            PeerSyncResponse::Bool(false)
+        } else if wants.len() == available.len() {
+            PeerSyncResponse::IdList(wants)
+        } else {
+            PeerSyncResponse::IdList(wants)
+        }
+    }
+
+    pub fn peer_sync_message_get(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        response: &PeerSyncResponse,
+        transfer_limit_kb: Option<f64>,
+        now_ms: u64,
+    ) -> Option<PeerSyncRequest> {
+        let wants = match response {
+            PeerSyncResponse::IdList(ids) => ids.clone(),
+            PeerSyncResponse::Bool(true) => self.propagation_store.list_ids(),
+            _ => Vec::new(),
+        };
+
+        if wants.is_empty() {
+            return None;
+        }
+
+        let peer = self.peers.upsert(peer_id, now_ms);
+        peer.last_attempt_ms = now_ms;
+        peer.state = PeerState::AwaitingPayload;
+
+        Some(PeerSyncRequest::MessageGet {
+            wants,
+            haves: self.propagation_store.list_ids(),
+            transfer_limit_kb,
+        })
+    }
+
+    pub fn handle_peer_sync_message_get(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        req: &PeerSyncRequest,
+        _now_ms: u64,
+    ) -> PeerSyncResponse {
+        match req {
+            PeerSyncRequest::MessageGetList => PeerSyncResponse::IdList(self.propagation_store.list_ids()),
+            PeerSyncRequest::MessageGet {
+                wants,
+                transfer_limit_kb,
+                ..
+            } => {
+                let limit_bytes = transfer_limit_kb.map(|kb| (kb * 1000.0) as usize);
+                let mut items = Vec::new();
+                let mut total_bytes = 0usize;
+                for id in wants {
+                    if let Some(entry) = self.propagation_store.get(id) {
+                        if let Ok(bytes) = propagation_entry_to_bytes(entry) {
+                            if let Some(limit) = limit_bytes {
+                                if total_bytes.saturating_add(bytes.len()) > limit {
+                                    continue;
+                                }
+                            }
+                            total_bytes = total_bytes.saturating_add(bytes.len());
+                            items.push(bytes);
+                        }
+                    }
+                }
+                if let Some(peer) = self.peers.get_mut(&peer_id) {
+                    peer.messages_outgoing = peer.messages_outgoing.saturating_add(items.len() as u64);
+                    peer.tx_bytes = peer.tx_bytes.saturating_add(total_bytes as u64);
+                }
+                self.node_stats.client_propagation_messages_served = self
+                    .node_stats
+                    .client_propagation_messages_served
+                    .saturating_add(items.len() as u64);
+                PeerSyncResponse::Payload(items)
+            }
+            _ => PeerSyncResponse::Error(0x01),
+        }
+    }
+
+    pub fn apply_peer_sync_payload(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        response: &PeerSyncResponse,
+        now_ms: u64,
+    ) -> Option<PeerSyncRequest> {
+        let mut delivered = Vec::new();
+        let mut invalid_count = 0usize;
+        let mut received_bytes = 0usize;
+        let min_stamp_cost = self
+            .propagation_validation
+            .map(|cfg| cfg.stamp_cost.saturating_sub(cfg.stamp_cost_flex));
+        if let PeerSyncResponse::Payload(items) = response {
+            for item in items {
+                received_bytes = received_bytes.saturating_add(item.len());
+                if let Ok(mut entry) = propagation_entry_from_bytes(item) {
+                    let mut accept = true;
+                    if let Some(cost) = min_stamp_cost {
+                        if let Some((transient_id, lxm_unstamped, _value, stamp)) =
+                            validate_pn_stamp(&entry.lxm_data, cost)
+                        {
+                            entry.transient_id = transient_id;
+                            let mut stamped = Vec::with_capacity(lxm_unstamped.len() + stamp.len());
+                            stamped.extend_from_slice(&lxm_unstamped);
+                            stamped.extend_from_slice(&stamp);
+                            entry.lxm_data = stamped;
+                        } else {
+                            accept = false;
+                            invalid_count = invalid_count.saturating_add(1);
+                        }
+                    }
+
+                    if accept {
+                        let seen = self.propagation_store.has(&entry.transient_id)
+                            || self.locally_processed.contains_key(&entry.transient_id);
+                        if !seen {
+                            self.propagation_store.insert(entry.clone());
+                            self.persist_propagation_entry(&entry);
+                            self.mark_locally_processed(entry.transient_id, now_ms);
+                        }
+                        delivered.push(entry.transient_id);
+                    }
+                }
+            }
+        }
+        let peer = self.peers.upsert(peer_id, now_ms);
+        peer.messages_incoming = peer.messages_incoming.saturating_add(delivered.len() as u64);
+        peer.messages_unhandled = invalid_count as u64;
+        peer.rx_bytes = peer.rx_bytes.saturating_add(received_bytes as u64);
+        if invalid_count > 0 {
+            peer.throttle(now_ms, PROPAGATION_INVALID_STAMP_THROTTLE_MS);
+        }
+        if delivered.is_empty() {
+            if invalid_count == 0 {
+                peer.on_payload_complete(now_ms);
+            }
+            return None;
+        }
+
+        if invalid_count == 0 {
+            peer.on_payload_complete(now_ms);
+        }
+        Some(PeerSyncRequest::MessageAck { delivered })
+    }
+
+    pub fn handle_peer_sync_ack(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        req: &PeerSyncRequest,
+        now_ms: u64,
+    ) -> PeerSyncResponse {
+        match req {
+            PeerSyncRequest::MessageAck { delivered } => {
+                for id in delivered {
+                    if let Some(entry) = self.propagation_store.get(id) {
+                        self.remove_propagation_entry_exact(entry);
+                    }
+                    self.propagation_store.remove(id);
+                }
+                let peer = self.peers.upsert(peer_id, now_ms);
+                peer.on_payload_complete(now_ms);
+                PeerSyncResponse::Bool(true)
+            }
+            _ => PeerSyncResponse::Error(0x01),
+        }
+    }
+
+    pub fn apply_peer_sync_response(
+        &mut self,
+        peer_id: [u8; DESTINATION_LENGTH],
+        response: &PeerSyncResponse,
+        now_ms: u64,
+    ) -> PeerState {
+        let peer = self.peers.upsert(peer_id, now_ms);
+        peer.on_offer_response(response, now_ms)
+    }
+
+    pub fn request_peer_sync(&mut self, peer_id: [u8; DESTINATION_LENGTH], now_ms: u64) -> bool {
+        if let Some(peer) = self.peers.get_mut(&peer_id) {
+            peer.next_sync_ms = now_ms;
+            peer.state = PeerState::Idle;
+            return true;
+        }
+        false
+    }
+
+    pub fn unpeer(&mut self, peer_id: [u8; DESTINATION_LENGTH]) -> bool {
+        let removed = self.peers.entries_mut().remove(&peer_id).is_some();
+        if removed {
+            if let Some(root) = &self.persistence_root {
+                let store = FileMessageStore::new(root);
+                store.remove_peer(&peer_id);
+            }
+        }
+        removed
+    }
+
+    pub fn compile_stats(&self, now_ms: u64) -> Value {
+        let identity_hash = self.runtime.router().local_identity_hash();
+        let destination_hash = identity_hash;
+        let uptime = now_ms
+            .saturating_sub(self.propagation_started_ms)
+            .saturating_add(1) as f64
+            / 1000.0;
+
+        let propagation_validation = self.propagation_validation.unwrap_or(PropagationValidation {
+            stamp_cost: DEFAULT_PROPAGATION_STAMP_COST,
+            stamp_cost_flex: DEFAULT_PROPAGATION_STAMP_FLEX,
+        });
+        let peering_cost = self
+            .peering_validation
+            .map(|validation| validation.target_cost)
+            .unwrap_or(DEFAULT_PEERING_COST);
+
+        let total_peers = self.peers.len() as u64;
+        let static_peers = self.static_peers.len() as u64;
+        let discovered_peers = total_peers.saturating_sub(static_peers);
+        let max_peers = self.max_peers.map(|v| v as u64);
+
+        let mut peer_map = Vec::new();
+        for (peer_id, peer) in self.peers.entries() {
+            let peer_type = if self.static_peers.contains(peer_id) {
+                "static"
+            } else {
+                "discovered"
+            };
+            let messages = Value::Map(vec![
+                (
+                    Value::from("offered"),
+                    Value::from(peer.messages_offered as i64),
+                ),
+                (
+                    Value::from("outgoing"),
+                    Value::from(peer.messages_outgoing as i64),
+                ),
+                (
+                    Value::from("incoming"),
+                    Value::from(peer.messages_incoming as i64),
+                ),
+                (
+                    Value::from("unhandled"),
+                    Value::from(peer.messages_unhandled as i64),
+                ),
+            ]);
+            let acceptance_rate = if peer.messages_offered > 0 {
+                peer.messages_incoming as f64 / peer.messages_offered as f64
+            } else {
+                0.0
+            };
+            let peer_entry = Value::Map(vec![
+                (Value::from("type"), Value::from(peer_type)),
+                (Value::from("alive"), Value::Boolean(!matches!(peer.state, PeerState::Backoff))),
+                (
+                    Value::from("last_heard"),
+                    Value::from(peer.last_heard_ms as i64 / 1000),
+                ),
+                (Value::from("network_distance"), Value::from(-1)),
+                (Value::from("rx_bytes"), Value::from(peer.rx_bytes as i64)),
+                (Value::from("tx_bytes"), Value::from(peer.tx_bytes as i64)),
+                (Value::from("messages"), messages),
+                (Value::from("acceptance_rate"), Value::from(acceptance_rate)),
+                (
+                    Value::from("peering_key"),
+                    peer.peering_key
+                        .as_ref()
+                        .map(|key| Value::Binary(key.clone()))
+                        .unwrap_or(Value::Nil),
+                ),
+                (Value::from("peering_cost"), Value::from(peering_cost as i64)),
+                (
+                    Value::from("target_stamp_cost"),
+                    Value::from(propagation_validation.stamp_cost as i64),
+                ),
+                (
+                    Value::from("stamp_cost_flexibility"),
+                    Value::from(propagation_validation.stamp_cost_flex as i64),
+                ),
+                (
+                    Value::from("transfer_limit"),
+                    Value::from(self.propagation_transfer_limit_kb),
+                ),
+                (
+                    Value::from("sync_limit"),
+                    Value::from(self.propagation_sync_limit_kb),
+                ),
+                (Value::from("name"), Value::Nil),
+                (
+                    Value::from("last_sync_attempt"),
+                    Value::from(peer.last_attempt_ms as i64 / 1000),
+                ),
+                (Value::from("str"), Value::from(0)),
+                (Value::from("ler"), Value::from(0)),
+            ]);
+            peer_map.push((Value::Binary(peer_id.to_vec()), peer_entry));
+        }
+
+        let message_store_limit = self.message_storage_limit_bytes().unwrap_or(0) as u64;
+
+        Value::Map(vec![
+            (Value::from("identity_hash"), Value::Binary(identity_hash.to_vec())),
+            (
+                Value::from("destination_hash"),
+                Value::Binary(destination_hash.to_vec()),
+            ),
+            (Value::from("uptime"), Value::from(uptime)),
+            (
+                Value::from("delivery_limit"),
+                Value::from(self.delivery_transfer_limit_kb),
+            ),
+            (
+                Value::from("propagation_limit"),
+                Value::from(self.propagation_transfer_limit_kb),
+            ),
+            (
+                Value::from("sync_limit"),
+                Value::from(self.propagation_sync_limit_kb),
+            ),
+            (
+                Value::from("target_stamp_cost"),
+                Value::from(propagation_validation.stamp_cost as i64),
+            ),
+            (
+                Value::from("stamp_cost_flexibility"),
+                Value::from(propagation_validation.stamp_cost_flex as i64),
+            ),
+            (Value::from("peering_cost"), Value::from(peering_cost as i64)),
+            (
+                Value::from("max_peering_cost"),
+                Value::from(self.max_peering_cost as i64),
+            ),
+            (
+                Value::from("autopeer_maxdepth"),
+                self.autopeer_maxdepth
+                    .map(|v| Value::from(v as i64))
+                    .unwrap_or(Value::Nil),
+            ),
+            (Value::from("from_static_only"), Value::Boolean(self.from_static_only)),
+            (
+                Value::from("messagestore"),
+                Value::Map(vec![
+                    (
+                        Value::from("count"),
+                        Value::from(self.propagation_store.entries().len() as i64),
+                    ),
+                    (
+                        Value::from("bytes"),
+                        Value::from(self.propagation_store.total_size_bytes() as i64),
+                    ),
+                    (Value::from("limit"), Value::from(message_store_limit as i64)),
+                ]),
+            ),
+            (
+                Value::from("clients"),
+                Value::Map(vec![
+                    (
+                        Value::from("client_propagation_messages_received"),
+                        Value::from(self.node_stats.client_propagation_messages_received as i64),
+                    ),
+                    (
+                        Value::from("client_propagation_messages_served"),
+                        Value::from(self.node_stats.client_propagation_messages_served as i64),
+                    ),
+                ]),
+            ),
+            (
+                Value::from("unpeered_propagation_incoming"),
+                Value::from(self.node_stats.unpeered_propagation_incoming as i64),
+            ),
+            (
+                Value::from("unpeered_propagation_rx_bytes"),
+                Value::from(self.node_stats.unpeered_propagation_rx_bytes as i64),
+            ),
+            (Value::from("static_peers"), Value::from(static_peers as i64)),
+            (
+                Value::from("discovered_peers"),
+                Value::from(discovered_peers as i64),
+            ),
+            (Value::from("total_peers"), Value::from(total_peers as i64)),
+            (
+                Value::from("max_peers"),
+                max_peers
+                    .map(|v| Value::from(v as i64))
+                    .unwrap_or(Value::Nil),
+            ),
+            (Value::from("peers"), Value::Map(peer_map)),
+        ])
+    }
+
+    pub fn enqueue(&mut self, msg: LXMessage, mode: DeliveryMode) -> u64 {
+        self.runtime.router_mut().enqueue(msg, mode)
+    }
+
+    pub fn receive_resource_payload(
+        &mut self,
+        payload: Vec<u8>,
+        source_hash: Option<[u8; DESTINATION_LENGTH]>,
+    ) {
+        self.runtime
+            .router_mut()
+            .receive_resource_payload(payload, source_hash);
+    }
+
+    pub fn receive_inbound(&mut self, received: super::transport::Received) {
+        self.runtime.router_mut().inbound.push_back(received);
+    }
+
+    pub fn tick(&mut self, now_ms: u64) -> RuntimeTick {
+        let mut tick = self.runtime.tick(now_ms);
+        if tick.pn_ran {
+            self.clean_transient_id_caches(now_ms);
+            self.poll_peer_sync_timeouts(now_ms);
+            self.schedule_peer_sync(now_ms);
+        }
+        if tick.store_ran {
+            self.clean_propagation_store(now_ms);
+        }
+        if !tick.request_timeouts.is_empty() {
+            self.handle_request_timeouts(&tick.request_timeouts, now_ms);
+        }
+        while let Some(req) = self.peer_sync_queue.pop_front() {
+            tick.peer_sync_requests.push(req);
+        }
+        tick
+    }
+
+    pub fn peer_sync_pending_len(&self) -> usize {
+        self.peer_sync_pending.len()
+    }
+
+    pub fn outbound_len(&self) -> usize {
+        self.runtime.router().outbound.len()
+    }
+
+    pub fn inflight_len(&self) -> usize {
+        self.runtime.router().inflight.len()
+    }
+
+    pub fn failed_len(&self) -> usize {
+        self.runtime.router().failed.len()
+    }
+
+    pub fn inbound_len(&self) -> usize {
+        self.runtime.router().inbound.len()
+    }
+}
+
+impl Drop for LxmfRouter {
+    fn drop(&mut self) {
+        self.save_node_stats();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingRequest {
+    pub request_id: [u8; DESTINATION_LENGTH],
+    pub path_hash: [u8; DESTINATION_LENGTH],
+    pub sent_at_ms: u64,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct RnsRequestManager {
+    pending: HashMap<[u8; DESTINATION_LENGTH], PendingRequest>,
+    responses: HashMap<[u8; DESTINATION_LENGTH], RnsResponse>,
+}
+
+impl RnsRequestManager {
+    pub fn new() -> Self {
+        Self {
+            pending: HashMap::new(),
+            responses: HashMap::new(),
+        }
+    }
+
+    pub fn register_request(
+        &mut self,
+        destination_hash: [u8; DESTINATION_LENGTH],
+        path: Option<String>,
+        data: Value,
+        now_ms: u64,
+        timeout_ms: u64,
+    ) -> Result<RnsRequest, RnsError> {
+        let path_hash = path
+            .as_deref()
+            .map(request_path_hash)
+            .unwrap_or([0u8; DESTINATION_LENGTH]);
+        let requested_at = now_ms as f64 / 1000.0;
+        let mut req = RnsRequest {
+            request_id: [0u8; DESTINATION_LENGTH],
+            requested_at,
+            path_hash,
+            data,
+        };
+        let payload = encode_request_bytes(&req).expect("encode request payload");
+        req.request_id = request_id_for_destination(destination_hash, &payload)?;
+        let pending = PendingRequest {
+            request_id: req.request_id,
+            path_hash,
+            sent_at_ms: now_ms,
+            timeout_ms,
+        };
+        self.pending.insert(req.request_id, pending);
+        Ok(req)
+    }
+
+    pub fn record_response(&mut self, response: RnsResponse) -> bool {
+        if self.pending.remove(&response.request_id).is_some() {
+            self.responses.insert(response.request_id, response);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn take_response(&mut self, request_id: [u8; DESTINATION_LENGTH]) -> Option<RnsResponse> {
+        self.responses.remove(&request_id)
+    }
+
+    pub fn is_pending(&self, request_id: [u8; DESTINATION_LENGTH]) -> bool {
+        self.pending.contains_key(&request_id)
+    }
+
+    pub fn poll_timeouts(&mut self, now_ms: u64) -> Vec<[u8; DESTINATION_LENGTH]> {
+        let timed_out: Vec<[u8; DESTINATION_LENGTH]> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| now_ms.saturating_sub(pending.sent_at_ms) >= pending.timeout_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &timed_out {
+            self.pending.remove(id);
+        }
+        timed_out
+    }
+}
+
+#[derive(Debug)]
+pub struct QueuedDelivery {
+    pub id: u64,
+    pub delivery: DeliveryOutput,
+    pub message: LXMessage,
+}
+
+#[derive(Debug, Clone)]
+pub struct InflightDelivery {
+    pub id: u64,
+    pub message: LXMessage,
+    pub sent_at_ms: u64,
+    pub timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RetryPolicy {
+    pub max_attempts: u32,
+    pub base_delay_ms: u64,
+    pub max_delay_ms: u64,
+}
+
+impl Default for RetryPolicy {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            base_delay_ms: 500,
+            max_delay_ms: 5_000,
+        }
+    }
+}
+
+pub struct RnsRouter {
+    pub(crate) outbound: VecDeque<QueuedMessage>,
+    pub(crate) failed: VecDeque<FailedDelivery>,
+    pub(crate) inbound: VecDeque<super::transport::Received>,
+    next_id: u64,
+    delivery: RnsOutbound,
+    retry: RetryPolicy,
+    store: Box<dyn MessageStore>,
+    pn_dir: Option<super::pn::PnDirService>,
+    inflight: HashMap<u64, InflightDelivery>,
+    on_delivered: Option<Box<dyn Fn(&QueuedDelivery) + Send + Sync>>,
+    on_failed: Option<Box<dyn Fn(&FailedDelivery) + Send + Sync>>,
+    delivered_cache: DeliveredCache,
+}
+
+impl RnsRouter {
+    pub fn new(delivery: RnsOutbound) -> Self {
+        Self {
+            outbound: VecDeque::new(),
+            failed: VecDeque::new(),
+            inbound: VecDeque::new(),
+            next_id: 1,
+            delivery,
+            retry: RetryPolicy::default(),
+            store: Box::new(InMemoryStore::default()),
+            pn_dir: None,
+            inflight: HashMap::new(),
+            on_delivered: None,
+            on_failed: None,
+            delivered_cache: DeliveredCache::new(DELIVERED_CACHE_MAX),
+        }
+    }
+
+    pub fn with_retry(delivery: RnsOutbound, retry: RetryPolicy) -> Self {
+        Self {
+            outbound: VecDeque::new(),
+            failed: VecDeque::new(),
+            inbound: VecDeque::new(),
+            next_id: 1,
+            delivery,
+            retry,
+            store: Box::new(InMemoryStore::default()),
+            pn_dir: None,
+            inflight: HashMap::new(),
+            on_delivered: None,
+            on_failed: None,
+            delivered_cache: DeliveredCache::new(DELIVERED_CACHE_MAX),
+        }
+    }
+
+    pub fn with_store(delivery: RnsOutbound, store: Box<dyn MessageStore>) -> Self {
+        let mut router = Self {
+            outbound: VecDeque::new(),
+            failed: VecDeque::new(),
+            inbound: VecDeque::new(),
+            next_id: 1,
+            delivery,
+            retry: RetryPolicy::default(),
+            store,
+            pn_dir: None,
+            inflight: HashMap::new(),
+            on_delivered: None,
+            on_failed: None,
+            delivered_cache: DeliveredCache::new(DELIVERED_CACHE_MAX),
+        };
+        router.restore_outbound();
+        router
+    }
+
+    pub fn with_pn_directory(delivery: RnsOutbound, directory: PnDirectory) -> Self {
+        let mut router = Self::new(delivery);
+        router.pn_dir = Some(super::pn::PnDirService::new(directory));
+        router
+    }
+
+    pub fn set_pn_directory(&mut self, directory: PnDirectory) {
+        self.pn_dir = Some(super::pn::PnDirService::new(directory));
+    }
+
+    pub fn pn_dir_service(&self) -> Option<&super::pn::PnDirService> {
+        self.pn_dir.as_ref()
+    }
+
+    pub fn pn_dir_service_mut(&mut self) -> Option<&mut super::pn::PnDirService> {
+        self.pn_dir.as_mut()
+    }
+
+    pub fn handle_pn_dir_request(
+        &mut self,
+        req: &super::pn::PnDirRequest,
+        now_ms: u64,
+    ) -> Option<super::pn::PnDirResponse> {
+        self.pn_dir.as_mut().map(|svc| svc.handle_request(req, now_ms))
+    }
+
+    pub fn apply_pn_dir_response(&mut self, resp: &super::pn::PnDirResponse, now_ms: u64) -> bool {
+        if let Some(svc) = self.pn_dir.as_mut() {
+            svc.apply_response(resp, now_ms);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn set_delivery_callback(&mut self, cb: Box<dyn Fn(&QueuedDelivery) + Send + Sync>) {
+        self.on_delivered = Some(cb);
+    }
+
+    pub fn set_failed_callback(&mut self, cb: Box<dyn Fn(&FailedDelivery) + Send + Sync>) {
+        self.on_failed = Some(cb);
+    }
+
+    pub fn crypto_policy(&self) -> RnsCryptoPolicy {
+        self.delivery.crypto_policy()
+    }
+
+    pub fn set_crypto_policy(&mut self, policy: RnsCryptoPolicy) {
+        self.delivery.set_crypto_policy(policy);
+    }
+
+    pub fn enqueue(&mut self, mut message: LXMessage, mode: DeliveryMode) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        message.state = STATE_OUTBOUND;
+        let item = QueuedMessage {
+            id,
+            message,
+            mode,
+            attempts: 0,
+            next_attempt_at_ms: 0,
+        };
+        self.store.save_outbound(&item);
+        self.outbound.push_back(item);
+        id
+    }
+
+    pub fn restore_outbound(&mut self) {
+        let mut items = self.store.load_outbound();
+        items.sort_by_key(|item| item.id);
+        let has_immediate = items.iter().any(|item| item.next_attempt_at_ms == 0);
+        let min_next = if has_immediate {
+            None
+        } else {
+            items
+                .iter()
+                .filter(|item| item.next_attempt_at_ms > 0)
+                .map(|item| item.next_attempt_at_ms)
+                .min()
+        };
+        for item in items {
+            let mut item = item;
+            if let Some(base) = min_next {
+                if item.next_attempt_at_ms > 0 && item.next_attempt_at_ms >= base {
+                    item.next_attempt_at_ms = item.next_attempt_at_ms.saturating_sub(base);
+                }
+            }
+            self.next_id = self.next_id.max(item.id.saturating_add(1));
+            self.outbound.push_back(item);
+        }
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.outbound.len()
+    }
+
+    pub fn inflight_len(&self) -> usize {
+        self.inflight.len()
+    }
+
+    pub fn failed_len(&self) -> usize {
+        self.failed.len()
+    }
+
+    pub fn pop_failed(&mut self) -> Option<FailedDelivery> {
+        self.failed.pop_front()
+    }
+
+    pub fn mark_inflight(&mut self, delivery: &QueuedDelivery, sent_at_ms: u64, timeout_ms: u64) {
+        let mut message = delivery.message.clone();
+        message.state = STATE_SENT;
+        let inflight = InflightDelivery {
+            id: delivery.id,
+            message,
+            sent_at_ms,
+            timeout_ms,
+        };
+        self.inflight.insert(delivery.id, inflight);
+    }
+
+    pub fn mark_delivered(&mut self, id: u64) -> Option<LXMessage> {
+        let inflight = self.inflight.remove(&id)?;
+        let mut message = inflight.message;
+        message.state = STATE_DELIVERED;
+        Some(message)
+    }
+
+    pub fn mark_failed(&mut self, id: u64, error: &str, attempts: u32) -> Option<FailedDelivery> {
+        let inflight = self.inflight.remove(&id)?;
+        let mut message = inflight.message;
+        message.state = STATE_FAILED;
+        let failed = FailedDelivery {
+            id,
+            error: error.to_string(),
+            message,
+            attempts,
+        };
+        self.store.save_failed(&failed);
+        self.failed.push_back(failed.clone());
+        if let Some(cb) = &self.on_failed {
+            cb(&failed);
+        }
+        Some(failed)
+    }
+
+    pub fn poll_timeouts(&mut self, now_ms: u64) -> Vec<FailedDelivery> {
+        let mut timed_out = Vec::new();
+        let expired: Vec<u64> = self
+            .inflight
+            .iter()
+            .filter(|(_, inflight)| now_ms.saturating_sub(inflight.sent_at_ms) >= inflight.timeout_ms)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            if let Some(failed) = self.mark_failed(id, "delivery timeout", 0) {
+                timed_out.push(failed);
+            }
+        }
+        timed_out
+    }
+
+    pub fn pop_inbound(&mut self) -> Option<super::transport::Received> {
+        self.inbound.pop_front()
+    }
+
+    pub fn receive_packet(
+        &mut self,
+        packet: &reticulum::packet::Packet,
+        mode: DeliveryMode,
+    ) -> Result<(), RnsError> {
+        self.receive_packet_with_source(packet, mode, None)
+    }
+
+    pub fn receive_packet_with_source(
+        &mut self,
+        packet: &reticulum::packet::Packet,
+        mode: DeliveryMode,
+        source_hash: Option<[u8; DESTINATION_LENGTH]>,
+    ) -> Result<(), RnsError> {
+        let received = super::transport::decode_packet_with_source(packet, mode, source_hash)?;
+        if let super::transport::Received::Message(msg) = &received {
+            if let Some(id) = msg.message_id {
+                if self.delivered_cache.seen_before(&id) {
+                    return Ok(());
+                }
+                self.delivered_cache.mark_delivered(id);
+            }
+            self.store.save_inbound(msg);
+        }
+        self.inbound.push_back(received);
+        Ok(())
+    }
+
+    pub fn receive_resource_payload(
+        &mut self,
+        payload: Vec<u8>,
+        source_hash: Option<[u8; DESTINATION_LENGTH]>,
+    ) {
+        self.inbound.push_back(super::transport::Received::PropagationResource {
+            payload,
+            source_hash,
+        });
+    }
+
+    pub fn next_delivery(&mut self, now_ms: u64) -> Option<Result<QueuedDelivery, RnsError>> {
+        let mut item = self.outbound.pop_front()?;
+        if now_ms < item.next_attempt_at_ms {
+            self.outbound.push_front(item);
+            return None;
+        }
+        item.attempts += 1;
+        item.message.state = STATE_SENDING;
+        match self.delivery.deliver(&mut item.message, item.mode) {
+            Ok(delivery) => {
+                item.message.state = STATE_SENT;
+                let queued = QueuedDelivery {
+                    id: item.id,
+                    delivery,
+                    message: item.message,
+                };
+                self.store.remove_outbound(queued.id);
+                if let Some(cb) = &self.on_delivered {
+                    cb(&queued);
+                }
+                Some(Ok(queued))
+            }
+            Err(err) => Some(Err(err)),
+        }
+    }
+
+    pub fn next_delivery_with_retry(
+        &mut self,
+        now_ms: u64,
+    ) -> Option<Result<QueuedDelivery, RnsError>> {
+        let mut item = self.outbound.pop_front()?;
+        if now_ms < item.next_attempt_at_ms {
+            self.outbound.push_front(item);
+            return None;
+        }
+
+        item.attempts += 1;
+        item.message.state = STATE_SENDING;
+        match self.delivery.deliver(&mut item.message, item.mode) {
+            Ok(delivery) => {
+                item.message.state = STATE_SENT;
+                let queued = QueuedDelivery {
+                    id: item.id,
+                    delivery,
+                    message: item.message,
+                };
+                self.store.remove_outbound(queued.id);
+                if let Some(cb) = &self.on_delivered {
+                    cb(&queued);
+                }
+                Some(Ok(queued))
+            }
+            Err(err) => {
+                if matches!(err, RnsError::CryptoPolicyViolation { .. }) {
+                    item.message.state = STATE_FAILED;
+                    let failed = FailedDelivery {
+                        id: item.id,
+                        error: err.to_string(),
+                        message: item.message,
+                        attempts: item.attempts,
+                    };
+                    self.store.remove_outbound(failed.id);
+                    self.store.save_failed(&failed);
+                    if let Some(cb) = &self.on_failed {
+                        cb(&failed);
+                    }
+                    self.failed.push_back(failed);
+                    return Some(Err(err));
+                }
+
+                if item.attempts < self.retry.max_attempts {
+                    let delay = retry_delay_ms(self.retry, item.attempts);
+                    item.next_attempt_at_ms = now_ms.saturating_add(delay);
+                    self.store.save_outbound(&item);
+                    self.outbound.push_back(item);
+                } else {
+                    item.message.state = STATE_FAILED;
+                    let failed = FailedDelivery {
+                        id: item.id,
+                        error: err.to_string(),
+                        message: item.message,
+                        attempts: item.attempts,
+                    };
+                    self.store.remove_outbound(failed.id);
+                    self.store.save_failed(&failed);
+                    if let Some(cb) = &self.on_failed {
+                        cb(&failed);
+                    }
+                    self.failed.push_back(failed);
+                }
+                Some(Err(err))
+            }
+        }
+    }
+
+    pub fn local_identity_hash(&self) -> [u8; DESTINATION_LENGTH] {
+        let mut out = [0u8; DESTINATION_LENGTH];
+        let slice = self
+            .delivery
+            .source
+            .identity
+            .as_identity()
+            .address_hash
+            .as_slice();
+        if slice.len() == DESTINATION_LENGTH {
+            out.copy_from_slice(slice);
+        }
+        out
+    }
+}
+
+fn retry_delay_ms(policy: RetryPolicy, attempt: u32) -> u64 {
+    let pow = attempt.saturating_sub(1).min(20) as u32;
+    let delay = policy.base_delay_ms.saturating_mul(1u64 << pow);
+    delay.min(policy.max_delay_ms)
+}
+
+fn insert_ticket_field(fields: &mut Value, expires_at_s: f64, ticket: &[u8]) {
+    let mut entries = match fields {
+        Value::Map(map) => map.clone(),
+        _ => Vec::new(),
+    };
+
+    entries.retain(|(key, _)| {
+        key.as_i64().map(|v| v as u64) != Some(FIELD_TICKET as u64)
+    });
+
+    entries.push((
+        Value::Integer((FIELD_TICKET as i64).into()),
+        Value::Array(vec![Value::F64(expires_at_s), Value::Binary(ticket.to_vec())]),
+    ));
+
+    *fields = Value::Map(entries);
+}
+
+fn extract_ticket_field(fields: &Value) -> Option<(f64, Vec<u8>)> {
+    let entries = match fields {
+        Value::Map(map) => map,
+        _ => return None,
+    };
+    for (key, val) in entries {
+        let key_id = key.as_i64().map(|v| v as u64)?;
+        if key_id != FIELD_TICKET as u64 {
+            continue;
+        }
+        let arr = match val {
+            Value::Array(arr) => arr,
+            _ => return None,
+        };
+        if arr.len() < 2 {
+            return None;
+        }
+        let expires_at_s = super::value_to_f64(&arr[0])?;
+        let ticket = match &arr[1] {
+            Value::Binary(bytes) => bytes.clone(),
+            _ => return None,
+        };
+        if ticket.len() != TICKET_LENGTH {
+            return None;
+        }
+        return Some((expires_at_s, ticket));
+    }
+    None
+}
+
+fn validate_stamp_with_tickets(
+    message: &mut LXMessage,
+    required_cost: u32,
+    tickets: Option<&Vec<Vec<u8>>>,
+) -> bool {
+    if let Some(list) = tickets {
+        for ticket in list {
+            if message
+                .validate_stamp(Some(required_cost), Some(ticket))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        }
+    }
+
+    message
+        .validate_stamp(Some(required_cost), None)
+        .unwrap_or(false)
+}
+
+fn system_now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
