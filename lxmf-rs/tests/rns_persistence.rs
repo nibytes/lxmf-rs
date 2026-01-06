@@ -143,6 +143,7 @@ fn propagation_resource_payload_persists_entries() {
     let config = RuntimeConfig::default();
     let mut router = LxmfRouter::with_store_and_root(outbound, Box::new(store), &root, config);
     router.clear_propagation_validation();
+    router.clear_peering_validation();
 
     let now_ms = 1_700_000_000_000u64;
     let msg1 = vec![0x01u8; 33];
@@ -155,7 +156,7 @@ fn propagation_resource_payload_persists_entries() {
     rmpv::encode::write_value(&mut buf, &payload).expect("msgpack");
 
     let accepted = router
-        .handle_propagation_resource_payload(None, None, None, &buf, now_ms)
+        .handle_propagation_resource_payload(Some([0x11u8; 16]), None, None, &buf, now_ms)
         .expect("accepted");
     assert_eq!(accepted.len(), 2);
 

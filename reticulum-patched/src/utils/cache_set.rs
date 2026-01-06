@@ -1,11 +1,13 @@
 use std::collections::{HashSet, VecDeque};
 
+#[allow(dead_code)]
 pub struct CacheSet<T: std::hash::Hash + Eq + Clone> {
     capacity: usize,
     set: HashSet<T>,
     queue: VecDeque<T>,
 }
 
+#[allow(dead_code)]
 impl<T: std::hash::Hash + Eq + Clone> CacheSet<T> {
     pub fn new(capacity: usize) -> Self {
         Self {

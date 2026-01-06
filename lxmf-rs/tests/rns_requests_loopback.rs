@@ -14,7 +14,7 @@ async fn request_send_over_udp_loopback() {
     let id_a = PrivateIdentity::new_from_name("req-node-a");
     let id_b = PrivateIdentity::new_from_name("req-node-b");
 
-    let node_a = RnsNodeRouter::new_udp(
+    let mut node_a = RnsNodeRouter::new_udp(
         "req-node-a",
         id_a.clone(),
         "127.0.0.1:4342",

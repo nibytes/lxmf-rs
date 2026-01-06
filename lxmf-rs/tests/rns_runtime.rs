@@ -14,7 +14,7 @@ async fn lxmf_over_udp_loopback() {
     let id_a = PrivateIdentity::new_from_name("node-a");
     let id_b = PrivateIdentity::new_from_name("node-b");
 
-    let node_a = RnsNodeRouter::new_udp("node-a", id_a.clone(), "127.0.0.1:4242", "127.0.0.1:4243")
+    let mut node_a = RnsNodeRouter::new_udp("node-a", id_a.clone(), "127.0.0.1:4242", "127.0.0.1:4243")
         .await
         .expect("node a");
     let mut node_b = RnsNodeRouter::new_udp("node-b", id_b.clone(), "127.0.0.1:4243", "127.0.0.1:4242")

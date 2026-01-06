@@ -51,11 +51,11 @@ async fn calculate_hop_distance() {
         .add_destination(id_a, DestinationName::new("test", "hop"))
         .await;
 
-    let dest_b = transport_b
+    let _dest_b = transport_b
         .add_destination(id_b, DestinationName::new("test", "hop"))
         .await;
 
-    let dest_c = transport_c
+    let _dest_c = transport_c
         .add_destination(id_c, DestinationName::new("test", "hop"))
         .await;
 

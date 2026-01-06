@@ -5,6 +5,7 @@ use crate::{
     packet::{DestinationType, Header, HeaderType, Packet, PacketType},
 };
 
+#[allow(dead_code)]
 pub struct PathEntry {
     pub timestamp: Instant,
     pub received_from: AddressHash,
@@ -13,10 +14,12 @@ pub struct PathEntry {
     pub packet_hash: Hash,
 }
 
+#[allow(dead_code)]
 pub struct PathTable {
     map: HashMap<AddressHash, PathEntry>,
 }
 
+#[allow(dead_code)]
 impl PathTable {
     pub fn new() -> Self {
         Self {
@@ -55,7 +58,7 @@ impl PathTable {
         (
             Packet {
                 header: Header {
-                    ifac_flag: todo!(),
+                    ifac_flag: original_packet.header.ifac_flag,
                     header_type: HeaderType::Type2,
                     propagation_type: original_packet.header.propagation_type,
                     destination_type: original_packet.header.destination_type,

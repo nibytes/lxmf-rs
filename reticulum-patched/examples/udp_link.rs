@@ -66,7 +66,7 @@ async fn main() {
             match link_event.event {
                 LinkEvent::Activated => log::info!("link {} activated", link_event.id),
                 LinkEvent::Closed => log::info!("link {} closed", link_event.id),
-                LinkEvent::Data(payload) => log::info!("link {} data payload: {}", link_event.id,
+                LinkEvent::Data { payload, .. } => log::info!("link {} data payload: {}", link_event.id,
                     std::str::from_utf8(payload.as_slice())
                         .map(str::to_string)
                         .unwrap_or_else(|_| format!("{:?}", payload.as_slice()))),

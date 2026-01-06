@@ -4,19 +4,17 @@ use clap::{ArgAction, Parser};
 use config::DaemonConfig;
 use log::LevelFilter;
 use lxmf_rs::{
-    decode_response_bytes, encode_request_bytes, DeliveryMode, DeliveryOutput, FileMessageStore,
-    LxmfRouter, LXMessage, QueuedDelivery, RnsOutbound, RnsRequest, RnsRequestManager,
-    RuntimeConfig, Value,
+    decode_response_bytes, DeliveryOutput, FileMessageStore, LxmfRouter, QueuedDelivery,
+    RnsNodeRouter, RnsOutbound, RnsRequest, RnsRequestManager, RuntimeConfig, Value,
 };
 use rand_core::OsRng;
 use reticulum::hash::AddressHash;
 use reticulum::identity::PrivateIdentity;
-use reticulum::packet::{DestinationType, Header, Packet, PacketContext, PacketDataBuffer, PacketType};
-use reticulum::transport::{Transport, TransportConfig};
-use reticulum::{error::RnsError, iface::udp::UdpInterface};
+use reticulum::request::RequestStatus;
+use reticulum::error::RnsError;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BIND_ADDR: &str = "127.0.0.1:4242";
 const DEFAULT_FORWARD_ADDR: &str = "127.0.0.1:4242";
@@ -34,6 +32,7 @@ const MIN_MESSAGE_STORE_MB: f64 = 0.005;
 
 struct ConfigPaths {
     config_dir: PathBuf,
+    #[allow(dead_code)]
     config_path: PathBuf,
     storage_dir: PathBuf,
     identity_path: PathBuf,
@@ -330,6 +329,7 @@ fn build_router(identity: PrivateIdentity, config: &DaemonConfig, paths: &Config
     router
 }
 
+#[cfg(test)]
 async fn dispatch_deliveries_with<F, Fut, E>(
     deliveries: Vec<QueuedDelivery>,
     mut send: F,
@@ -348,51 +348,39 @@ where
 }
 
 async fn dispatch_deliveries(
-    node_router: &lxmf_rs::RnsNodeRouter,
+    node_router: &mut lxmf_rs::RnsNodeRouter,
     deliveries: Vec<QueuedDelivery>,
 ) -> usize {
-    dispatch_deliveries_with(deliveries, |delivery| async move {
-        match delivery.delivery {
+    let mut sent = 0usize;
+    for delivery in deliveries {
+        let result = match delivery.delivery {
             DeliveryOutput::Packet(packet) => {
                 node_router.transport.send_packet(packet).await;
+                Ok(())
             }
-            DeliveryOutput::Resource { destination, data, .. } => {
-                node_router.transport.send_to_out_links(&destination, &data).await;
-            }
+            DeliveryOutput::Resource {
+                destination,
+                data,
+                context: _,
+            } => node_router
+                .send_resource_payload(destination, &data)
+                .await
+                .map_err(map_lxmf_error),
             DeliveryOutput::PaperUri(uri) => {
                 println!("paper delivery: {uri}");
+                Ok(())
             }
+        };
+        if result.is_ok() {
+            sent = sent.saturating_add(1);
         }
-        Ok::<(), std::io::Error>(())
-    })
-    .await
+    }
+    sent
 }
 
 fn format_status(router: &LxmfRouter, now_ms: u64, show_status: bool, show_peers: bool) -> String {
     let stats = router.compile_stats(now_ms);
     format_stats_output(&stats, show_status, show_peers)
-}
-
-fn packet_from_payload(
-    destination: AddressHash,
-    payload: &[u8],
-    context: PacketContext,
-) -> Result<Packet, RnsError> {
-    let mut data = PacketDataBuffer::new();
-    data.write(payload)?;
-
-    Ok(Packet {
-        header: Header {
-            destination_type: DestinationType::Single,
-            packet_type: PacketType::Data,
-            ..Default::default()
-        },
-        ifac: None,
-        destination,
-        transport: None,
-        context,
-        data,
-    })
 }
 
 fn map_reticulum_error(err: RnsError) -> std::io::Error {
@@ -401,10 +389,6 @@ fn map_reticulum_error(err: RnsError) -> std::io::Error {
 
 fn map_lxmf_error(err: lxmf_rs::RnsError) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, format!("lxmf error: {err:?}"))
-}
-
-fn parse_destination_hash(hex: &str) -> Result<AddressHash, std::io::Error> {
-    AddressHash::new_from_hex_string(hex).map_err(map_reticulum_error)
 }
 
 fn parse_destination_bytes(hex: &str) -> Result<[u8; 16], std::io::Error> {
@@ -803,52 +787,56 @@ async fn remote_control_request(
         .as_deref()
         .unwrap_or(DEFAULT_FORWARD_ADDR);
 
-    let destination = parse_destination_hash(remote)?;
     let destination_bytes = parse_destination_bytes(remote)?;
 
-    let config = TransportConfig::new("lxmd-remote", &identity, true);
-    let transport = Transport::new(config);
-    transport
-        .iface_manager()
-        .lock()
-        .await
-        .spawn(UdpInterface::new(bind_addr, Some(forward_addr)), UdpInterface::spawn);
+    let mut node_router = RnsNodeRouter::new_udp(
+        "lxmd-remote",
+        identity,
+        bind_addr,
+        forward_addr,
+    )
+    .await
+    .map_err(map_lxmf_error)?;
 
     let mut requests = RnsRequestManager::new();
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-    let req: RnsRequest = requests.register_request(
+    let mut req: RnsRequest = requests.register_request(
         destination_bytes,
         Some(path.to_string()),
         data,
         now_ms,
         5_000,
     )?;
-    let payload = encode_request_bytes(&req).map_err(map_lxmf_error)?;
-    let packet = packet_from_payload(destination, &payload, PacketContext::Request).map_err(map_reticulum_error)?;
-    transport.send_packet(packet).await;
+    let receipt = node_router
+        .send_request_with_receipt_to_hash(destination_bytes, &mut req, timeout)
+        .await?;
 
-    let mut rx = transport.iface_rx();
-    let start = SystemTime::now();
+    let start = Instant::now();
     loop {
-        let remaining = timeout
-            .checked_sub(start.elapsed().unwrap_or_default())
-            .unwrap_or(Duration::from_secs(0));
-        if remaining.is_zero() {
+        node_router.poll_inbound().await;
+        let status = receipt.lock().unwrap().status;
+        match status {
+            RequestStatus::Ready => {
+                let response_bytes = receipt
+                    .lock()
+                    .unwrap()
+                    .response
+                    .clone()
+                    .ok_or("empty response")?;
+                let response = decode_response_bytes(&response_bytes).map_err(map_lxmf_error)?;
+                return Ok(response.data);
+            }
+            RequestStatus::Failed => return Err("remote request failed".into()),
+            _ => {}
+        }
+
+        if start.elapsed() >= timeout {
             return Err("remote stats timed out".into());
         }
-
-        let message = tokio::time::timeout(remaining, rx.recv()).await??;
-        let packet = message.packet;
-        if packet.context != PacketContext::Response {
-            continue;
-        }
-        let response = decode_response_bytes(packet.data.as_slice()).map_err(map_lxmf_error)?;
-        if response.request_id == req.request_id {
-            return Ok(response.data);
-        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -990,27 +978,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let mut node_router = {
-        let config = TransportConfig::new(node_name, &identity, true);
-        let mut transport = Transport::new(config);
-        transport
-            .iface_manager()
-            .lock()
-            .await
-            .spawn(UdpInterface::new(bind_addr, Some(forward_addr)), UdpInterface::spawn);
-        let destination = transport
-            .add_destination(identity.clone(), reticulum::destination::DestinationName::new("lxmf", "delivery"))
-            .await;
-        let in_events = transport.in_link_events();
-        let out_events = transport.out_link_events();
-        lxmf_rs::RnsNodeRouter {
-            identity,
-            transport,
-            destination,
-            in_events,
-            out_events,
-        }
-    };
+    let mut node_router = lxmf_rs::RnsNodeRouter::new_udp(
+        node_name,
+        identity.clone(),
+        &bind_addr,
+        &forward_addr,
+    )
+    .await?;
 
     let mut router = build_router(identity.clone(), &config, &paths);
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64;
@@ -1043,8 +1017,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default()
             .as_millis() as u64;
         let tick = router.tick(now_ms);
-        let _ = dispatch_deliveries(&node_router, tick.deliveries).await;
-        for (mut request, peer_id) in router.dispatch_peer_sync_requests(&tick, now_ms) {
+        let peer_requests = router.dispatch_peer_sync_requests(&tick, now_ms);
+        let _ = dispatch_deliveries(&mut node_router, tick.deliveries).await;
+        for (mut request, peer_id) in peer_requests {
             let _ = node_router.send_request_to_hash(peer_id, &mut request).await;
         }
         for received in node_router.poll_inbound().await {
@@ -1088,6 +1063,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lxmf_rs::{DeliveryMode, LXMessage};
     use lxmf_rs::RnsRouter;
 
     #[test]

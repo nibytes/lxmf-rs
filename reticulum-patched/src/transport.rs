@@ -35,7 +35,7 @@ use crate::iface::TxMessageType;
 use crate::packet::DestinationType;
 use crate::packet::Header;
 use crate::packet::PacketDataBuffer;
-use crate::packet::{Packet, PacketType};
+use crate::packet::{Packet, PacketContext, PacketType};
 
 mod packet_cache;
 mod path_table;
@@ -53,6 +53,7 @@ const INTERVAL_IFACE_CLEANUP: Duration = Duration::from_secs(10);
 
 pub struct TransportConfig {
     name: String,
+    #[allow(dead_code)]
     identity: PrivateIdentity,
     broadcast: bool,
     retransmit: bool,
@@ -69,6 +70,7 @@ struct TransportHandler {
     iface_manager: Arc<Mutex<InterfaceManager>>,
     announce_tx: broadcast::Sender<AnnounceEvent>,
 
+    #[allow(dead_code)]
     path_table: PathTable,
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
@@ -240,7 +242,12 @@ impl Transport {
         }
     }
 
-    pub async fn send_to_out_links(&self, destination: &AddressHash, payload: &[u8]) {
+    pub async fn send_to_out_links_with_context(
+        &self,
+        destination: &AddressHash,
+        payload: &[u8],
+        context: PacketContext,
+    ) {
         let mut count = 0usize;
         let handler = self.handler.lock().await;
         for link in handler.out_links.values() {
@@ -248,7 +255,7 @@ impl Transport {
             if link.destination().address_hash == *destination
                 && link.status() == LinkStatus::Active
             {
-                let packet = link.data_packet(payload);
+                let packet = link.data_packet_with_context(context, payload);
                 if let Ok(packet) = packet {
                     handler.send_packet(packet).await;
                     count += 1;
@@ -263,6 +270,39 @@ impl Transport {
                 destination
             );
         }
+    }
+
+    pub async fn send_to_link_id_with_context(
+        &self,
+        link_id: &AddressHash,
+        payload: &[u8],
+        context: PacketContext,
+    ) -> bool {
+        let handler = self.handler.lock().await;
+        if let Some(link) = handler.in_links.get(link_id) {
+            let link = link.lock().await;
+            if link.status() == LinkStatus::Active {
+                if let Ok(packet) = link.data_packet_with_context(context, payload) {
+                    handler.send_packet(packet).await;
+                    return true;
+                }
+            }
+        }
+        for link in handler.out_links.values() {
+            let link = link.lock().await;
+            if link.id() == link_id && link.status() == LinkStatus::Active {
+                if let Ok(packet) = link.data_packet_with_context(context, payload) {
+                    handler.send_packet(packet).await;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub async fn send_to_out_links(&self, destination: &AddressHash, payload: &[u8]) {
+        self.send_to_out_links_with_context(destination, payload, PacketContext::None)
+            .await;
     }
 
     pub async fn send_to_in_links(&self, destination: &AddressHash, payload: &[u8]) {
@@ -607,6 +647,7 @@ async fn handle_cleanup<'a>(handler: MutexGuard<'a, TransportHandler>) {
     handler.iface_manager.lock().await.cleanup();
 }
 
+#[allow(dead_code)]
 fn create_retransmit_packet(packet: &Packet) -> Packet {
     Packet {
         header: Header {

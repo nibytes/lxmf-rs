@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct LxmfConfig {
     pub display_name: Option<String>,
@@ -10,6 +11,7 @@ pub struct LxmfConfig {
     pub on_inbound: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize, Clone)]
 pub struct PropagationConfig {
     pub enable_node: Option<bool>,
@@ -59,16 +61,15 @@ mod tests {
 
     #[test]
     fn parses_minimal_config() {
-        let cfg: DaemonConfig = toml::from_str(
-            "storage_path = \"/tmp/lxmd\"\n"
-                .to_string()
-                + "identity_path = \"/tmp/lxmd/identity\"\n"
-                + "inbound_dir = \"/tmp/lxmd/messages\"\n\n"
-                + "[logging]\nloglevel = 3\n\n"
-                + "[lxmf]\n"
-                + "display_name = \"Example\"\n"
-                + "announce_at_start = true\n",
-        )
+        let raw = "storage_path = \"/tmp/lxmd\"\n"
+            .to_string()
+            + "identity_path = \"/tmp/lxmd/identity\"\n"
+            + "inbound_dir = \"/tmp/lxmd/messages\"\n\n"
+            + "[logging]\nloglevel = 3\n\n"
+            + "[lxmf]\n"
+            + "display_name = \"Example\"\n"
+            + "announce_at_start = true\n";
+        let cfg: DaemonConfig = toml::from_str(&raw)
         .expect("config");
 
         assert_eq!(cfg.storage_path.unwrap().to_string_lossy(), "/tmp/lxmd");

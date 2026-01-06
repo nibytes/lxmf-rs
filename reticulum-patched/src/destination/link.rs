@@ -111,7 +111,7 @@ pub enum LinkHandleResult {
 #[derive(Clone)]
 pub enum LinkEvent {
     Activated,
-    Data(LinkPayload),
+    Data { payload: LinkPayload, context: PacketContext },
     Closed,
 }
 
@@ -274,7 +274,10 @@ impl Link {
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     log::trace!("link({}): data {}B", self.id, plain_text.len());
                     self.request_time = Instant::now();
-                    self.post_event(LinkEvent::Data(LinkPayload::new_from_slice(plain_text)));
+                    self.post_event(LinkEvent::Data {
+                        payload: LinkPayload::new_from_slice(plain_text),
+                        context: packet.context,
+                    });
                 } else {
                     log::error!("link({}): can't decrypt packet", self.id);
                 }
@@ -291,7 +294,24 @@ impl Link {
                     return LinkHandleResult::None;
                 }
             }
-            _ => {}
+            _ => {
+                let mut buffer = [0u8; PACKET_MDU];
+                if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
+                    log::trace!(
+                        "link({}): data {}B ctx={:02x}",
+                        self.id,
+                        plain_text.len(),
+                        packet.context as u8
+                    );
+                    self.request_time = Instant::now();
+                    self.post_event(LinkEvent::Data {
+                        payload: LinkPayload::new_from_slice(plain_text),
+                        context: packet.context,
+                    });
+                } else {
+                    log::error!("link({}): can't decrypt packet", self.id);
+                }
+            }
         }
 
         LinkHandleResult::None
@@ -334,6 +354,14 @@ impl Link {
     }
 
     pub fn data_packet(&self, data: &[u8]) -> Result<Packet, RnsError> {
+        self.data_packet_with_context(PacketContext::None, data)
+    }
+
+    pub fn data_packet_with_context(
+        &self,
+        context: PacketContext,
+        data: &[u8],
+    ) -> Result<Packet, RnsError> {
         if self.status != LinkStatus::Active {
             log::warn!("link: can't create data packet for closed link");
         }
@@ -356,7 +384,7 @@ impl Link {
             ifac: None,
             destination: self.id,
             transport: None,
-            context: PacketContext::None,
+            context,
             data: packet_data,
         })
     }

@@ -5,7 +5,7 @@ use lxmf_rs::{
     validate_peering_key, validate_pn_stamp, LxmfRouter, PeerSyncRequest, PeerSyncResponse,
     PropagationEntry, RnsOutbound, RnsRouter, RuntimeConfig, Value, LXMessage,
 };
-use rand_core::RngCore;
+use rand_core::{OsRng, RngCore};
 use reticulum::identity::PrivateIdentity;
 use rmpv::Value as RmpValue;
 
@@ -130,9 +130,20 @@ fn peer_sync_payload_validates_pn_stamps() {
     };
     let valid_payload = encode_entry(&valid_entry);
 
-    let mut bad_data = lxm_data.clone();
-    if let Some(last) = bad_data.last_mut() {
-        *last ^= 0x01;
+    let mut bad_stamp = [0u8; 32];
+    let base_len = lxm_data.len().saturating_sub(32);
+    let base_data = lxm_data[..base_len].to_vec();
+    let mut bad_data = Vec::new();
+    loop {
+        OsRng.fill_bytes(&mut bad_stamp);
+        bad_data.clear();
+        bad_data.extend_from_slice(&base_data);
+        bad_data.extend_from_slice(&bad_stamp);
+        if let Some((_id, _payload, value, _stamp)) = validate_pn_stamp(&bad_data, 0) {
+            if value < 2 {
+                break;
+            }
+        }
     }
     let invalid_entry = PropagationEntry {
         transient_id: [0x88u8; 32],
