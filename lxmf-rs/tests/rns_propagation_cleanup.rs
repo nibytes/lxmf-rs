@@ -97,7 +97,13 @@ fn propagation_cleanup_runs_on_tick_interval() {
     };
     router.propagation_store_mut().insert(expired_entry.clone());
 
-    let tick = router.tick(now_ms);
+    // JOB_STORE_INTERVAL = 120, so we need to call tick() 120 times
+    // to get processing_count = 120, which is divisible by 120
+    let mut tick = router.tick(now_ms);
+    for i in 1..120 {
+        tick = router.tick(now_ms + i);
+    }
+    // Now processing_count = 120, so store_ran should be true
     assert!(tick.store_ran);
     assert!(!router.propagation_store().has(&expired_entry.transient_id));
 }

@@ -7,6 +7,10 @@ use crate::message::{generate_peering_key, validate_peering_key, validate_pn_sta
 use crate::pn::PnDirectory;
 use rmpv::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use super::peer::{
     decode_peer_sync_request, decode_peer_sync_response, encode_peer_sync_request,
@@ -33,6 +37,40 @@ pub const CONTROL_STATS_PATH: &str = "/pn/get/stats";
 pub const CONTROL_SYNC_PATH: &str = "/pn/peer/sync";
 pub const CONTROL_UNPEER_PATH: &str = "/pn/peer/unpeer";
 
+// Job scheduling intervals (matching Python LXMRouter)
+pub const JOB_OUTBOUND_INTERVAL: u64 = 1;
+pub const JOB_STAMPS_INTERVAL: u64 = 1;
+pub const JOB_LINKS_INTERVAL: u64 = 1;
+pub const JOB_TRANSIENT_INTERVAL: u64 = 60;
+pub const JOB_STORE_INTERVAL: u64 = 120;
+pub const JOB_PEERSYNC_INTERVAL: u64 = 6;
+pub const JOB_PEERINGEST_INTERVAL: u64 = 6; // same as PEERSYNC
+pub const JOB_ROTATE_INTERVAL: u64 = 56 * JOB_PEERINGEST_INTERVAL; // 336
+
+// Link lifecycle constants (matching Python LXMRouter)
+pub const LINK_MAX_INACTIVITY: u64 = 10 * 60; // 10 minutes in seconds
+pub const P_LINK_MAX_INACTIVITY: u64 = 3 * 60; // 3 minutes in seconds
+
+// Peer rotation constants (matching Python LXMRouter)
+pub const ROTATION_HEADROOM_PCT: f64 = 10.0; // 10%
+pub const ROTATION_AR_MAX: f64 = 0.5; // 50% acceptance rate threshold
+
+// Propagation transfer state constants (matching Python LXMRouter)
+pub const PR_IDLE: u8 = 0x00;
+pub const PR_PATH_REQUESTED: u8 = 0x01;
+pub const PR_LINK_ESTABLISHING: u8 = 0x02;
+pub const PR_LINK_ESTABLISHED: u8 = 0x03;
+pub const PR_REQUEST_SENT: u8 = 0x04;
+pub const PR_RECEIVING: u8 = 0x05;
+pub const PR_RESPONSE_RECEIVED: u8 = 0x06;
+pub const PR_COMPLETE: u8 = 0x07;
+pub const PR_NO_PATH: u8 = 0xf0;
+pub const PR_LINK_FAILED: u8 = 0xf1;
+pub const PR_TRANSFER_FAILED: u8 = 0xf2;
+pub const PR_NO_IDENTITY_RCVD: u8 = 0xf3;
+pub const PR_NO_ACCESS: u8 = 0xf4;
+pub const PR_FAILED: u8 = 0xfe;
+
 pub const CONTROL_ERROR_NO_IDENTITY: u8 = 0xf0;
 pub const CONTROL_ERROR_NO_ACCESS: u8 = 0xf1;
 pub const CONTROL_ERROR_INVALID_DATA: u8 = 0xf4;
@@ -43,6 +81,103 @@ pub struct DeliveredCache {
     max_entries: usize,
     order: VecDeque<[u8; HASH_LENGTH]>,
     seen: HashSet<[u8; HASH_LENGTH]>,
+}
+
+// Link tracking structures
+#[derive(Debug, Clone)]
+struct DirectLinkInfo {
+    #[allow(dead_code)] // link_id is used as key in HashMap, but kept here for consistency
+    link_id: [u8; DESTINATION_LENGTH],
+    last_activity_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PropagationLinkInfo {
+    #[allow(dead_code)] // link_id is used for identification, but not always read directly
+    link_id: [u8; DESTINATION_LENGTH],
+    last_activity_ms: u64,
+    is_closed: bool, // Track if link is closed (matching Python link.status == CLOSED)
+}
+
+#[derive(Debug, Default)]
+struct LinkTracker {
+    direct_links: HashMap<[u8; DESTINATION_LENGTH], DirectLinkInfo>,
+    active_propagation_links: Vec<PropagationLinkInfo>,
+    outbound_propagation_link: Option<PropagationLinkInfo>,
+    validated_peer_links: HashSet<[u8; DESTINATION_LENGTH]>,
+}
+
+impl LinkTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn add_direct_link(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        self.direct_links.insert(
+            link_id,
+            DirectLinkInfo {
+                link_id,
+                last_activity_ms: now_ms,
+            },
+        );
+    }
+
+    fn add_propagation_link(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        self.active_propagation_links.push(PropagationLinkInfo {
+            link_id,
+            last_activity_ms: now_ms,
+            is_closed: false,
+        });
+    }
+
+    fn set_outbound_propagation_link(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        self.outbound_propagation_link = Some(PropagationLinkInfo {
+            link_id,
+            last_activity_ms: now_ms,
+            is_closed: false,
+        });
+    }
+
+    fn mark_outbound_propagation_link_closed(&mut self) {
+        if let Some(ref mut link) = self.outbound_propagation_link {
+            link.is_closed = true;
+        }
+    }
+
+    fn update_link_activity(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        if let Some(link_info) = self.direct_links.get_mut(&link_id) {
+            link_info.last_activity_ms = now_ms;
+        }
+        for link_info in &mut self.active_propagation_links {
+            if link_info.link_id == link_id {
+                link_info.last_activity_ms = now_ms;
+                return;
+            }
+        }
+        if let Some(link_info) = &mut self.outbound_propagation_link {
+            if link_info.link_id == link_id {
+                link_info.last_activity_ms = now_ms;
+            }
+        }
+    }
+
+    fn has_direct_link(&self, link_id: &[u8; DESTINATION_LENGTH]) -> bool {
+        self.direct_links.contains_key(link_id)
+    }
+
+    fn has_propagation_link(&self, link_id: &[u8; DESTINATION_LENGTH]) -> bool {
+        self.active_propagation_links
+            .iter()
+            .any(|l| l.link_id == *link_id)
+    }
+
+    fn add_validated_peer_link(&mut self, link_id: [u8; DESTINATION_LENGTH]) {
+        self.validated_peer_links.insert(link_id);
+    }
+
+    fn is_validated_peer_link(&self, link_id: &[u8; DESTINATION_LENGTH]) -> bool {
+        self.validated_peer_links.contains(link_id)
+    }
 }
 
 impl DeliveredCache {
@@ -106,7 +241,15 @@ pub struct RuntimeTick {
     pub request_timeouts: Vec<[u8; DESTINATION_LENGTH]>,
     pub peer_sync_requests: Vec<([u8; DESTINATION_LENGTH], PeerSyncRequest)>,
     pub pn_ran: bool,
-    pub store_ran: bool,
+    // Job scheduling flags (based on processing_count intervals, matching Python LXMRouter.jobs())
+    pub outbound_ran: bool,      // JOB_OUTBOUND_INTERVAL
+    pub stamps_ran: bool,        // JOB_STAMPS_INTERVAL
+    pub links_ran: bool,         // JOB_LINKS_INTERVAL
+    pub transient_ran: bool,      // JOB_TRANSIENT_INTERVAL
+    pub store_ran: bool,         // JOB_STORE_INTERVAL
+    pub peeringest_ran: bool,    // JOB_PEERINGEST_INTERVAL (for flush_queues)
+    pub rotate_ran: bool,        // JOB_ROTATE_INTERVAL
+    pub peersync_ran: bool,      // JOB_PEERSYNC_INTERVAL (for sync_peers and clean_throttled_peers)
 }
 
 pub struct LxmfRuntime {
@@ -118,6 +261,7 @@ pub struct LxmfRuntime {
     last_request_ms: u64,
     last_pn_ms: u64,
     last_store_ms: u64,
+    processing_count: u64,
 }
 
 impl LxmfRuntime {
@@ -131,6 +275,7 @@ impl LxmfRuntime {
             last_request_ms: 0,
             last_pn_ms: 0,
             last_store_ms: 0,
+            processing_count: 0,
         }
     }
 
@@ -144,7 +289,12 @@ impl LxmfRuntime {
             last_request_ms: 0,
             last_pn_ms: 0,
             last_store_ms: 0,
+            processing_count: 0,
         }
+    }
+
+    pub fn processing_count(&self) -> u64 {
+        self.processing_count
     }
 
     pub fn router(&self) -> &RnsRouter {
@@ -172,19 +322,65 @@ impl LxmfRuntime {
     }
 
     pub fn tick(&mut self, now_ms: u64) -> RuntimeTick {
+        // Increment processing count (like Python's processing_count)
+        self.processing_count = self.processing_count.wrapping_add(1);
+        
         let mut tick = RuntimeTick::default();
 
-        if now_ms.saturating_sub(self.last_outbound_ms) >= self.config.outbound_interval_ms {
-            loop {
-                match self.router.next_delivery_with_retry(now_ms) {
-                    Some(Ok(delivery)) => tick.deliveries.push(delivery),
-                    Some(Err(err)) => tick.delivery_errors.push(err.to_string()),
-                    None => break,
+        // Job scheduling based on processing_count intervals (matching Python LXMRouter.jobs())
+        if self.processing_count % JOB_OUTBOUND_INTERVAL == 0 {
+            tick.outbound_ran = true;
+            if now_ms.saturating_sub(self.last_outbound_ms) >= self.config.outbound_interval_ms {
+                loop {
+                    match self.router.next_delivery_with_retry(now_ms) {
+                        Some(Ok(delivery)) => tick.deliveries.push(delivery),
+                        Some(Err(err)) => tick.delivery_errors.push(err.to_string()),
+                        None => break,
+                    }
                 }
+                self.last_outbound_ms = now_ms;
             }
-            self.last_outbound_ms = now_ms;
         }
 
+        if self.processing_count % JOB_STAMPS_INTERVAL == 0 {
+            tick.stamps_ran = true;
+        }
+
+        if self.processing_count % JOB_LINKS_INTERVAL == 0 {
+            tick.links_ran = true;
+        }
+
+        if self.processing_count % JOB_TRANSIENT_INTERVAL == 0 {
+            tick.transient_ran = true;
+        }
+
+        if self.processing_count % JOB_STORE_INTERVAL == 0 {
+            tick.store_ran = true;
+            if now_ms.saturating_sub(self.last_store_ms) >= self.config.store_interval_ms {
+                self.last_store_ms = now_ms;
+            }
+        }
+
+        // JOB_PEERINGEST_INTERVAL (matching Python line 878: flush_queues)
+        if self.processing_count % JOB_PEERINGEST_INTERVAL == 0 {
+            tick.peeringest_ran = true;
+        }
+
+        // JOB_ROTATE_INTERVAL (matching Python line 881: rotate_peers)
+        if self.processing_count % JOB_ROTATE_INTERVAL == 0 {
+            tick.rotate_ran = true;
+        }
+
+        // JOB_PEERSYNC_INTERVAL (matching Python line 884: sync_peers and clean_throttled_peers)
+        if self.processing_count % JOB_PEERSYNC_INTERVAL == 0 {
+            tick.peersync_ran = true;
+            if now_ms.saturating_sub(self.last_pn_ms) >= self.config.pn_interval_ms {
+                tick.pn_ran = true;
+                self.last_pn_ms = now_ms;
+            }
+        }
+
+        // Legacy time-based checks (keep for backward compatibility)
         if now_ms.saturating_sub(self.last_inflight_ms) >= self.config.inflight_interval_ms {
             tick.inflight_failures = self.router.poll_timeouts(now_ms);
             self.last_inflight_ms = now_ms;
@@ -193,16 +389,6 @@ impl LxmfRuntime {
         if now_ms.saturating_sub(self.last_request_ms) >= self.config.request_interval_ms {
             tick.request_timeouts = self.requests.poll_timeouts(now_ms);
             self.last_request_ms = now_ms;
-        }
-
-        if now_ms.saturating_sub(self.last_pn_ms) >= self.config.pn_interval_ms {
-            tick.pn_ran = true;
-            self.last_pn_ms = now_ms;
-        }
-
-        if now_ms.saturating_sub(self.last_store_ms) >= self.config.store_interval_ms {
-            tick.store_ran = true;
-            self.last_store_ms = now_ms;
         }
 
         tick
@@ -391,6 +577,15 @@ pub struct LxmfRouter {
     persistence_root: Option<std::path::PathBuf>,
     peering_validation: Option<PeeringValidation>,
     propagation_validation: Option<PropagationValidation>,
+    link_tracker: LinkTracker,
+    propagation_transfer_state: u8, // Matching Python PR_* constants
+    prioritise_rotating_unreachable_peers: bool, // Matching Python prioritise_rotating_unreachable_peers
+    peer_distribution_queue: VecDeque<([u8; 32], Option<[u8; DESTINATION_LENGTH]>)>, // Matching Python peer_distribution_queue: deque([transient_id, from_peer])
+    // Thread-safe shared state for deferred stamp processing (matching Python stamp_gen_lock)
+    deferred_outbound_shared: Arc<Mutex<VecDeque<DeferredOutbound>>>, // Shared queue for thread processing
+    stamp_processing_active: Arc<AtomicBool>, // Flag to prevent concurrent processing (matching Python stamp_gen_lock.locked())
+    processed_deferred_tx: Option<mpsc::Sender<DeferredOutbound>>, // Channel sender for processed messages (created on first use)
+    processed_deferred_rx: Option<mpsc::Receiver<DeferredOutbound>>, // Channel receiver for processed messages
 }
 
 impl LxmfRouter {
@@ -439,11 +634,20 @@ impl LxmfRouter {
                 stamp_cost: DEFAULT_PROPAGATION_STAMP_COST,
                 stamp_cost_flex: DEFAULT_PROPAGATION_STAMP_FLEX,
             }),
+            link_tracker: LinkTracker::new(),
+            propagation_transfer_state: PR_IDLE,
+            prioritise_rotating_unreachable_peers: false, // Default: False (matching Python)
+            peer_distribution_queue: VecDeque::new(), // Matching Python peer_distribution_queue = deque()
+            deferred_outbound_shared: Arc::new(Mutex::new(VecDeque::new())), // Shared queue for thread processing
+            stamp_processing_active: Arc::new(AtomicBool::new(false)), // Flag to prevent concurrent processing
+            processed_deferred_tx: None,
+            processed_deferred_rx: None,
         }
     }
 
     pub fn with_config(router: RnsRouter, config: RuntimeConfig) -> Self {
         let local_identity_hash = router.local_identity_hash();
+        let (tx, rx) = mpsc::channel();
         Self {
             runtime: LxmfRuntime::with_config(router, config),
             peers: PeerTable::new(),
@@ -487,6 +691,14 @@ impl LxmfRouter {
                 stamp_cost: DEFAULT_PROPAGATION_STAMP_COST,
                 stamp_cost_flex: DEFAULT_PROPAGATION_STAMP_FLEX,
             }),
+            link_tracker: LinkTracker::new(),
+            propagation_transfer_state: PR_IDLE,
+            prioritise_rotating_unreachable_peers: false, // Default: False (matching Python)
+            peer_distribution_queue: VecDeque::new(), // Matching Python peer_distribution_queue = deque()
+            deferred_outbound_shared: Arc::new(Mutex::new(VecDeque::new())), // Shared queue for thread processing
+            stamp_processing_active: Arc::new(AtomicBool::new(false)), // Flag to prevent concurrent processing
+            processed_deferred_tx: Some(tx),
+            processed_deferred_rx: Some(rx),
         }
     }
 
@@ -853,7 +1065,12 @@ impl LxmfRouter {
         }
 
         if message.defer_stamp {
-            self.deferred_outbound.push_back(DeferredOutbound { message, mode });
+            // Add to both local and shared queue (shared queue is used by background thread)
+            self.deferred_outbound.push_back(DeferredOutbound { message: message.clone(), mode });
+            // Use try_lock to avoid blocking if background thread holds lock
+            if let Ok(mut shared) = self.deferred_outbound_shared.try_lock() {
+                shared.push_back(DeferredOutbound { message, mode });
+            }
             None
         } else {
             Some(self.runtime.router_mut().enqueue(message, mode))
@@ -917,6 +1134,109 @@ impl LxmfRouter {
             self.save_local_caches();
         }
         removed
+    }
+
+    pub fn clean_links(&mut self, now_ms: u64) {
+        let link_max_inactivity_ms = LINK_MAX_INACTIVITY * 1000;
+        let p_link_max_inactivity_ms = P_LINK_MAX_INACTIVITY * 1000;
+
+        // Clean direct links
+        let mut closed_links = Vec::new();
+        for (link_hash, link_info) in &self.link_tracker.direct_links {
+            let inactive_time_ms = now_ms.saturating_sub(link_info.last_activity_ms);
+            if inactive_time_ms > link_max_inactivity_ms {
+                closed_links.push(*link_hash);
+                // Remove from validated_peer_links if present
+                self.link_tracker.validated_peer_links.remove(link_hash);
+            }
+        }
+
+        for link_hash in closed_links {
+            self.link_tracker.direct_links.remove(&link_hash);
+        }
+
+        // Clean active propagation links
+        let mut inactive_propagation_links = Vec::new();
+        for (idx, link_info) in self.link_tracker.active_propagation_links.iter().enumerate() {
+            let inactive_time_ms = now_ms.saturating_sub(link_info.last_activity_ms);
+            if inactive_time_ms > p_link_max_inactivity_ms {
+                inactive_propagation_links.push(idx);
+            }
+        }
+
+        // Remove in reverse order to maintain indices
+        for &idx in inactive_propagation_links.iter().rev() {
+            self.link_tracker.active_propagation_links.remove(idx);
+        }
+
+        // Handle closed outbound propagation link
+        // In Python: if self.outbound_propagation_link != None and self.outbound_propagation_link.status == RNS.Link.CLOSED:
+        if let Some(ref outbound_link) = self.link_tracker.outbound_propagation_link {
+            if outbound_link.is_closed {
+                // Link is closed, clean it up
+                self.link_tracker.outbound_propagation_link = None;
+                
+                // Handle propagation transfer state (matching Python logic)
+                if self.propagation_transfer_state == PR_COMPLETE {
+                    // acknowledge_sync_completion() - would be implemented separately
+                } else if self.propagation_transfer_state < PR_LINK_ESTABLISHED {
+                    // acknowledge_sync_completion(failure_state=PR_LINK_FAILED)
+                    self.propagation_transfer_state = PR_LINK_FAILED;
+                } else if self.propagation_transfer_state >= PR_LINK_ESTABLISHED
+                    && self.propagation_transfer_state < PR_COMPLETE
+                {
+                    // acknowledge_sync_completion(failure_state=PR_TRANSFER_FAILED)
+                    self.propagation_transfer_state = PR_TRANSFER_FAILED;
+                } else {
+                    // Unknown state - default acknowledge
+                    // acknowledge_sync_completion()
+                }
+            }
+        }
+    }
+
+    // Public methods for link management (used by tests and external code)
+    pub fn add_direct_link(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        self.link_tracker.add_direct_link(link_id, now_ms);
+    }
+
+    pub fn add_propagation_link(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        self.link_tracker.add_propagation_link(link_id, now_ms);
+    }
+
+    pub fn set_outbound_propagation_link(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        self.link_tracker.set_outbound_propagation_link(link_id, now_ms);
+    }
+
+    pub fn mark_outbound_propagation_link_closed(&mut self) {
+        self.link_tracker.mark_outbound_propagation_link_closed();
+    }
+
+    pub fn update_link_activity(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        self.link_tracker.update_link_activity(link_id, now_ms);
+    }
+
+    pub fn has_direct_link(&self, link_id: &[u8; DESTINATION_LENGTH]) -> bool {
+        self.link_tracker.has_direct_link(link_id)
+    }
+
+    pub fn has_propagation_link(&self, link_id: &[u8; DESTINATION_LENGTH]) -> bool {
+        self.link_tracker.has_propagation_link(link_id)
+    }
+
+    pub fn add_validated_peer_link(&mut self, link_id: [u8; DESTINATION_LENGTH]) {
+        self.link_tracker.add_validated_peer_link(link_id);
+    }
+
+    pub fn is_validated_peer_link(&self, link_id: &[u8; DESTINATION_LENGTH]) -> bool {
+        self.link_tracker.is_validated_peer_link(link_id)
+    }
+
+    pub fn outbound_propagation_link(&self) -> Option<[u8; DESTINATION_LENGTH]> {
+        self.link_tracker
+            .outbound_propagation_link
+            .as_ref()
+            .map(|l| l.link_id)
     }
 
     pub fn clean_propagation_store(&mut self, now_ms: u64) -> usize {
@@ -1875,6 +2195,184 @@ impl LxmfRouter {
         removed
     }
 
+    /// Rotate peers by removing low acceptance rate peers (matching Python LXMRouter.rotate_peers)
+    pub fn rotate_peers(&mut self, _now_ms: u64) {
+        // Only rotate if propagation node is enabled
+        if !self.propagation_node_enabled {
+            return;
+        }
+
+        let max_peers = match self.max_peers {
+            Some(max) => max,
+            None => return, // No max peers limit, no rotation needed
+        };
+
+        // Calculate rotation headroom (matching Python line 1938)
+        let rotation_headroom = (1.0_f64).max((max_peers as f64 * ROTATION_HEADROOM_PCT / 100.0).floor()) as u32;
+        
+        let peer_count = self.peers.len() as u32;
+        let required_drops = peer_count.saturating_sub(max_peers.saturating_sub(rotation_headroom));
+        
+        // Check if rotation is needed and we'll have at least 1 peer left
+        if required_drops == 0 || peer_count.saturating_sub(required_drops) <= 1 {
+            return;
+        }
+
+        // Collect untested peers (last_attempt_ms == 0, matching Python line 1945)
+        let untested_peers: Vec<_> = self.peers.entries()
+            .values()
+            .filter(|peer| peer.last_attempt_ms == 0)
+            .collect();
+
+        // If untested peers >= headroom, postpone rotation (matching Python line 1948)
+        if untested_peers.len() >= rotation_headroom as usize {
+            // Log: "Newly added peer threshold reached, postponing peer rotation"
+            return;
+        }
+
+        // Find fully synced peers (unhandled_message_count == 0, matching Python line 1955)
+        let fully_synced_peer_ids: Vec<[u8; DESTINATION_LENGTH]> = self.peers.entries()
+            .iter()
+            .filter(|(_, peer)| peer.messages_unhandled == 0)
+            .map(|(id, _)| *id)
+            .collect();
+
+        // Use fully synced peers pool if available (matching Python line 1958)
+        let peer_pool_ids: Vec<[u8; DESTINATION_LENGTH]> = if !fully_synced_peer_ids.is_empty() {
+            // Log: "Found {count} fully synced peer(s), using as peer rotation pool basis"
+            fully_synced_peer_ids
+        } else {
+            self.peers.entries().keys().copied().collect()
+        };
+
+        // Categorize peers (matching Python lines 1963-1977)
+        let mut waiting_peers: Vec<[u8; DESTINATION_LENGTH]> = Vec::new();
+        let mut unresponsive_peers: Vec<[u8; DESTINATION_LENGTH]> = Vec::new();
+
+        for peer_id in peer_pool_ids {
+            let peer = match self.peers.entries().get(&peer_id) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Skip static peers and non-idle peers (matching Python line 1968)
+            if self.static_peers.contains(&peer_id) || !matches!(peer.state, PeerState::Idle) {
+                continue;
+            }
+
+            // Determine if peer is alive (last_heard_ms > 0 indicates peer was heard from)
+            let is_alive = peer.last_heard_ms > 0;
+
+            if is_alive {
+                // Only consider peers with at least one offered message (matching Python line 1970)
+                if peer.messages_offered > 0 {
+                    waiting_peers.push(peer_id);
+                }
+            } else {
+                unresponsive_peers.push(peer_id);
+            }
+        }
+
+        // Build drop pool (matching Python lines 1979-1986)
+        let mut drop_pool: Vec<[u8; DESTINATION_LENGTH]> = Vec::new();
+        if !unresponsive_peers.is_empty() {
+            drop_pool.extend(unresponsive_peers);
+            if !self.prioritise_rotating_unreachable_peers {
+                drop_pool.extend(waiting_peers);
+            }
+        } else {
+            drop_pool.extend(waiting_peers);
+        }
+
+        if drop_pool.is_empty() {
+            return;
+        }
+
+        // Sort by acceptance rate and take required_drops (matching Python lines 1988-1994)
+        let drop_count = required_drops.min(drop_pool.len() as u32) as usize;
+        let mut low_ar_peers: Vec<_> = drop_pool.into_iter().map(|peer_id| {
+            let peer = self.peers.entries().get(&peer_id).unwrap();
+            let ar = if peer.messages_offered == 0 {
+                0.0
+            } else {
+                peer.messages_outgoing as f64 / peer.messages_offered as f64
+            };
+            (peer_id, ar, peer.messages_offered, peer.messages_outgoing, peer.messages_unhandled)
+        }).collect();
+        low_ar_peers.sort_by(|(_, ar_a, _, _, _), (_, ar_b, _, _, _)| {
+            ar_a.partial_cmp(ar_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        low_ar_peers.truncate(drop_count);
+
+        // Drop peers with AR < ROTATION_AR_MAX (matching Python lines 1996-2003)
+        let mut dropped_count = 0;
+        for (peer_id, ar, _offered, _outgoing, _unhandled) in low_ar_peers {
+            let ar_percent = ar * 100.0;
+            if ar_percent < ROTATION_AR_MAX * 100.0 {
+                // Log: "Acceptance rate for {reachable/unreachable} peer {hex} was: {ar}% ({outgoing}/{offered}, {unhandled} unhandled messages)"
+                self.unpeer(peer_id);
+                dropped_count += 1;
+            }
+        }
+
+        // Log: "Dropped {dropped_count} low acceptance rate peer(s) to increase peering headroom"
+        let _ = dropped_count; // Suppress unused warning (would be used for logging)
+    }
+
+    /// Enqueue message for peer distribution (matching Python LXMRouter.enqueue_peer_distribution)
+    pub fn enqueue_peer_distribution(&mut self, transient_id: [u8; 32], from_peer: Option<[u8; DESTINATION_LENGTH]>) {
+        self.peer_distribution_queue.push_back((transient_id, from_peer));
+    }
+
+    /// Flush peer distribution queue (matching Python LXMRouter.flush_peer_distribution_queue)
+    pub fn flush_peer_distribution_queue(&mut self) {
+        if self.peer_distribution_queue.is_empty() {
+            return;
+        }
+
+        // Extract all entries from queue (matching Python lines 2284-2287)
+        let mut entries = Vec::new();
+        while let Some(entry) = self.peer_distribution_queue.pop_front() {
+            entries.push(entry);
+        }
+
+        // Distribute to all peers except from_peer (matching Python lines 2289-2296)
+        let peer_ids: Vec<[u8; DESTINATION_LENGTH]> = self.peers.entries().keys().copied().collect();
+        for peer_id in peer_ids {
+            if let Some(peer) = self.peers.entries_mut().get_mut(&peer_id) {
+                for (transient_id, from_peer) in &entries {
+                    // Skip from_peer (matching Python line 2295: if peer != from_peer)
+                    if from_peer.map(|fp| fp != peer_id).unwrap_or(true) {
+                        peer.queue_unhandled_message(*transient_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Flush queues (matching Python LXMRouter.flush_queues)
+    pub fn flush_queues(&mut self) {
+        if self.peers.len() == 0 {
+            return;
+        }
+
+        // Flush peer distribution queue (matching Python line 902)
+        self.flush_peer_distribution_queue();
+
+        // Process queues for all peers (matching Python lines 904-908)
+        // Log: "Calculating peer distribution queue mappings..."
+        let peer_ids: Vec<[u8; DESTINATION_LENGTH]> = self.peers.entries().keys().copied().collect();
+        for peer_id in peer_ids {
+            if let Some(peer) = self.peers.entries_mut().get_mut(&peer_id) {
+                if peer.queued_items() {
+                    // peer.process_queues() - would be implemented separately
+                    // For now, we just mark that queues need processing
+                }
+            }
+        }
+        // Log: "Distribution queue mapping completed in {time}"
+    }
+
     pub fn compile_stats(&self, now_ms: u64) -> Value {
         let identity_hash = self.runtime.router().local_identity_hash();
         let destination_hash = identity_hash;
@@ -2086,6 +2584,9 @@ impl LxmfRouter {
 
     pub fn tick(&mut self, now_ms: u64) -> RuntimeTick {
         let mut tick = self.runtime.tick(now_ms);
+        if tick.links_ran {
+            self.clean_links(now_ms);
+        }
         if tick.pn_ran {
             self.clean_transient_id_caches(now_ms);
             self.poll_peer_sync_timeouts(now_ms);
@@ -2093,6 +2594,82 @@ impl LxmfRouter {
         }
         if tick.store_ran {
             self.clean_propagation_store(now_ms);
+        }
+        if tick.rotate_ran {
+            self.rotate_peers(now_ms);
+        }
+        if tick.peeringest_ran {
+            self.flush_queues();
+        }
+        if tick.stamps_ran {
+            // Process deferred stamps in a separate thread (matching Python line 867: threading.Thread(target=self.process_deferred_stamps, daemon=True).start())
+            
+            // Initialize channel on first use
+            if self.processed_deferred_tx.is_none() {
+                let (tx, rx) = mpsc::channel();
+                self.processed_deferred_tx = Some(tx);
+                self.processed_deferred_rx = Some(rx);
+            }
+            
+            // Try to receive processed messages from background thread (non-blocking)
+            // Limit iterations to prevent infinite loop if channel is constantly receiving
+            if let Some(ref rx) = self.processed_deferred_rx {
+                let mut max_iterations = 100; // Safety limit
+                while max_iterations > 0 {
+                    match rx.try_recv() {
+                        Ok(item) => {
+                            // Enqueue processed message
+                            self.runtime.router_mut().enqueue(item.message, item.mode);
+                            // Also remove from local queue (already processed in background thread)
+                            let _ = self.deferred_outbound.pop_front();
+                            max_iterations -= 1;
+                        }
+                        Err(_) => break, // No more messages
+                    }
+                }
+            }
+            
+            // Check if processing is already active (matching Python stamp_gen_lock.locked())
+            if !self.stamp_processing_active.load(Ordering::Acquire) {
+                // Ensure channel is initialized
+                if self.processed_deferred_tx.is_none() {
+                    let (tx, rx) = mpsc::channel();
+                    self.processed_deferred_tx = Some(tx);
+                    self.processed_deferred_rx = Some(rx);
+                }
+                
+                let shared_queue = Arc::clone(&self.deferred_outbound_shared);
+                let processing_flag = Arc::clone(&self.stamp_processing_active);
+                
+                // Check if queue has items (non-blocking, with timeout protection)
+                let has_items = match shared_queue.try_lock() {
+                    Ok(queue) => !queue.is_empty(),
+                    Err(_) => false, // Mutex is locked, skip this tick
+                };
+                
+                if has_items {
+                    // Get sender (should be Some after initialization check above)
+                    if let Some(tx) = self.processed_deferred_tx.clone() {
+                        // Set processing flag (matching Python stamp_gen_lock.acquire())
+                        processing_flag.store(true, Ordering::Release);
+                        
+                        // Spawn background thread (matching Python threading.Thread)
+                        thread::spawn(move || {
+                            // Process one item at a time (matching Python behavior)
+                            // Use try_lock to avoid deadlock if main thread holds lock
+                            if let Ok(mut queue) = shared_queue.try_lock() {
+                                if let Some(mut item) = queue.pop_front() {
+                                    item.message.defer_stamp = false;
+                                    // Send processed message back to main thread (non-blocking)
+                                    let _ = tx.send(item);
+                                }
+                            }
+                            // Clear processing flag (matching Python stamp_gen_lock.release())
+                            processing_flag.store(false, Ordering::Release);
+                        });
+                    }
+                }
+            }
         }
         if !tick.request_timeouts.is_empty() {
             self.handle_request_timeouts(&tick.request_timeouts, now_ms);

@@ -1,6 +1,6 @@
 use crate::constants::DESTINATION_LENGTH;
 use rmpv::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Cursor;
 
 use super::{value_to_bytes, value_to_f64, value_to_fixed_bytes, RnsError};
@@ -113,6 +113,9 @@ pub struct Peer {
     pub messages_incoming: u64,
     pub messages_unhandled: u64,
     pub peering_key: Option<Vec<u8>>,
+    // Message queues (matching Python LXMPeer)
+    pub(crate) handled_messages_queue: VecDeque<[u8; 32]>,   // Matching Python handled_messages_queue
+    pub(crate) unhandled_messages_queue: VecDeque<[u8; 32]>, // Matching Python unhandled_messages_queue
 }
 
 impl Peer {
@@ -133,7 +136,34 @@ impl Peer {
             messages_incoming: 0,
             messages_unhandled: 0,
             peering_key: None,
+            handled_messages_queue: VecDeque::new(),
+            unhandled_messages_queue: VecDeque::new(),
         }
+    }
+
+    /// Queue unhandled message (matching Python LXMPeer.queue_unhandled_message)
+    pub fn queue_unhandled_message(&mut self, transient_id: [u8; 32]) {
+        self.unhandled_messages_queue.push_back(transient_id);
+    }
+
+    /// Queue handled message (matching Python LXMPeer.queue_handled_message)
+    pub fn queue_handled_message(&mut self, transient_id: [u8; 32]) {
+        self.handled_messages_queue.push_back(transient_id);
+    }
+
+    /// Check if peer has queued items (matching Python LXMPeer.queued_items)
+    pub fn queued_items(&self) -> bool {
+        !self.handled_messages_queue.is_empty() || !self.unhandled_messages_queue.is_empty()
+    }
+
+    /// Get unhandled messages queue (for testing)
+    pub fn unhandled_messages_queue(&self) -> &VecDeque<[u8; 32]> {
+        &self.unhandled_messages_queue
+    }
+
+    /// Get handled messages queue (for testing)
+    pub fn handled_messages_queue(&self) -> &VecDeque<[u8; 32]> {
+        &self.handled_messages_queue
     }
 
     pub fn should_sync(&self, now_ms: u64) -> bool {
