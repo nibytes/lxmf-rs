@@ -28,6 +28,8 @@ use super::transport::{
     RnsRequest, RnsResponse,
 };
 use super::{DeliveryMode, RnsCryptoPolicy, RnsError};
+#[cfg(feature = "rns")]
+use reticulum::destination::link::{LinkEventData, LinkEvent};
 use rand_core::RngCore;
 
 const DELIVERED_CACHE_MAX: usize = 2048;
@@ -579,6 +581,10 @@ pub struct LxmfRouter {
     propagation_validation: Option<PropagationValidation>,
     link_tracker: LinkTracker,
     propagation_transfer_state: u8, // Matching Python PR_* constants
+    propagation_transfer_last_result: Option<u32>, // Matching Python propagation_transfer_last_result
+    propagation_transfer_progress: f64, // Matching Python propagation_transfer_progress (0.0-1.0)
+    wants_download_on_path_available_from: Option<[u8; DESTINATION_LENGTH]>, // Matching Python wants_download_on_path_available_from
+    wants_download_on_path_available_to: Option<[u8; DESTINATION_LENGTH]>, // Matching Python wants_download_on_path_available_to
     prioritise_rotating_unreachable_peers: bool, // Matching Python prioritise_rotating_unreachable_peers
     peer_distribution_queue: VecDeque<([u8; 32], Option<[u8; DESTINATION_LENGTH]>)>, // Matching Python peer_distribution_queue: deque([transient_id, from_peer])
     // Thread-safe shared state for deferred stamp processing (matching Python stamp_gen_lock)
@@ -636,6 +642,10 @@ impl LxmfRouter {
             }),
             link_tracker: LinkTracker::new(),
             propagation_transfer_state: PR_IDLE,
+            propagation_transfer_last_result: None, // Matching Python propagation_transfer_last_result = None
+            propagation_transfer_progress: 0.0, // Matching Python propagation_transfer_progress = 0.0
+            wants_download_on_path_available_from: None, // Matching Python wants_download_on_path_available_from = None
+            wants_download_on_path_available_to: None, // Matching Python wants_download_on_path_available_to = None
             prioritise_rotating_unreachable_peers: false, // Default: False (matching Python)
             peer_distribution_queue: VecDeque::new(), // Matching Python peer_distribution_queue = deque()
             deferred_outbound_shared: Arc::new(Mutex::new(VecDeque::new())), // Shared queue for thread processing
@@ -693,6 +703,10 @@ impl LxmfRouter {
             }),
             link_tracker: LinkTracker::new(),
             propagation_transfer_state: PR_IDLE,
+            propagation_transfer_last_result: None, // Matching Python propagation_transfer_last_result = None
+            propagation_transfer_progress: 0.0, // Matching Python propagation_transfer_progress = 0.0
+            wants_download_on_path_available_from: None, // Matching Python wants_download_on_path_available_from = None
+            wants_download_on_path_available_to: None, // Matching Python wants_download_on_path_available_to = None
             prioritise_rotating_unreachable_peers: false, // Default: False (matching Python)
             peer_distribution_queue: VecDeque::new(), // Matching Python peer_distribution_queue = deque()
             deferred_outbound_shared: Arc::new(Mutex::new(VecDeque::new())), // Shared queue for thread processing
@@ -939,6 +953,76 @@ impl LxmfRouter {
         self.persistence_root = root;
     }
 
+    // Propagation transfer state management (matching Python LXMRouter)
+    pub fn propagation_transfer_state(&self) -> u8 {
+        self.propagation_transfer_state
+    }
+
+    pub fn set_propagation_transfer_state(&mut self, state: u8) {
+        self.propagation_transfer_state = state;
+    }
+
+    pub fn propagation_transfer_last_result(&self) -> Option<u32> {
+        self.propagation_transfer_last_result
+    }
+
+    pub fn set_propagation_transfer_last_result(&mut self, result: Option<u32>) {
+        self.propagation_transfer_last_result = result;
+    }
+
+    pub fn propagation_transfer_progress(&self) -> f64 {
+        self.propagation_transfer_progress
+    }
+
+    pub fn set_propagation_transfer_progress(&mut self, progress: f64) {
+        self.propagation_transfer_progress = progress;
+    }
+
+    pub fn wants_download_on_path_available_from(&self) -> Option<[u8; DESTINATION_LENGTH]> {
+        self.wants_download_on_path_available_from
+    }
+
+    pub fn set_wants_download_on_path_available_from(&mut self, from: Option<[u8; DESTINATION_LENGTH]>) {
+        self.wants_download_on_path_available_from = from;
+    }
+
+    pub fn wants_download_on_path_available_to(&self) -> Option<[u8; DESTINATION_LENGTH]> {
+        self.wants_download_on_path_available_to
+    }
+
+    pub fn set_wants_download_on_path_available_to(&mut self, to: Option<[u8; DESTINATION_LENGTH]>) {
+        self.wants_download_on_path_available_to = to;
+    }
+
+    /// Acknowledge sync completion (matching Python LXMRouter.acknowledge_sync_completion)
+    /// 
+    /// Resets propagation transfer state and related fields:
+    /// - Sets propagation_transfer_last_result to None
+    /// - Resets propagation_transfer_progress to 0.0
+    /// - Clears wants_download_on_path_available_from/to
+    /// - Updates propagation_transfer_state based on reset_state and failure_state parameters
+    pub fn acknowledge_sync_completion(&mut self, reset_state: bool, failure_state: Option<u8>) {
+        // Reset last result (matching Python: self.propagation_transfer_last_result = None)
+        self.propagation_transfer_last_result = None;
+        
+        // Update state if reset_state is true or current state <= PR_COMPLETE
+        // (matching Python: if reset_state or self.propagation_transfer_state <= LXMRouter.PR_COMPLETE)
+        if reset_state || self.propagation_transfer_state <= PR_COMPLETE {
+            if let Some(failure) = failure_state {
+                self.propagation_transfer_state = failure;
+            } else {
+                self.propagation_transfer_state = PR_IDLE;
+            }
+        }
+        
+        // Reset progress (matching Python: self.propagation_transfer_progress = 0.0)
+        self.propagation_transfer_progress = 0.0;
+        
+        // Clear wants_download fields (matching Python: self.wants_download_on_path_available_from/to = None)
+        self.wants_download_on_path_available_from = None;
+        self.wants_download_on_path_available_to = None;
+    }
+
     pub fn set_outbound_stamp_cost(
         &mut self,
         destination_hash: [u8; DESTINATION_LENGTH],
@@ -1178,18 +1262,16 @@ impl LxmfRouter {
                 
                 // Handle propagation transfer state (matching Python logic)
                 if self.propagation_transfer_state == PR_COMPLETE {
-                    // acknowledge_sync_completion() - would be implemented separately
+                    self.acknowledge_sync_completion(false, None);
                 } else if self.propagation_transfer_state < PR_LINK_ESTABLISHED {
-                    // acknowledge_sync_completion(failure_state=PR_LINK_FAILED)
-                    self.propagation_transfer_state = PR_LINK_FAILED;
+                    self.acknowledge_sync_completion(false, Some(PR_LINK_FAILED));
                 } else if self.propagation_transfer_state >= PR_LINK_ESTABLISHED
                     && self.propagation_transfer_state < PR_COMPLETE
                 {
-                    // acknowledge_sync_completion(failure_state=PR_TRANSFER_FAILED)
-                    self.propagation_transfer_state = PR_TRANSFER_FAILED;
+                    self.acknowledge_sync_completion(false, Some(PR_TRANSFER_FAILED));
                 } else {
                     // Unknown state - default acknowledge
-                    // acknowledge_sync_completion()
+                    self.acknowledge_sync_completion(false, None);
                 }
             }
         }
@@ -1214,6 +1296,87 @@ impl LxmfRouter {
 
     pub fn update_link_activity(&mut self, link_id: [u8; DESTINATION_LENGTH], now_ms: u64) {
         self.link_tracker.update_link_activity(link_id, now_ms);
+    }
+
+    /// Process link events from reticulum-rs to update LinkTracker state
+    /// This integrates with real Reticulum link events to match Python behavior
+    /// where link.no_data_for() and link.status are checked directly
+    /// 
+    /// Events are processed as follows:
+    /// - LinkEvent::Data - updates last_activity_ms (matching link.no_data_for() reset)
+    /// - LinkEvent::Activated - creates/updates link entry
+    /// - LinkEvent::Closed - sets is_closed flag (matching link.status == CLOSED)
+    /// 
+    /// This method should be called from the daemon loop when processing link events
+    /// from RnsNodeRouter::poll_inbound() or similar event sources.
+    #[cfg(feature = "rns")]
+    pub fn process_link_events(&mut self, events: &[LinkEventData], now_ms: u64) {
+        for event in events {
+            // Convert LinkId (AddressHash) to [u8; DESTINATION_LENGTH]
+            let link_id_bytes = event.id.as_slice();
+            if link_id_bytes.len() != DESTINATION_LENGTH {
+                continue;
+            }
+            let mut link_id = [0u8; DESTINATION_LENGTH];
+            link_id.copy_from_slice(link_id_bytes);
+
+            // Convert address_hash to [u8; DESTINATION_LENGTH]
+            let address_hash_bytes = event.address_hash.as_slice();
+            let address_hash = if address_hash_bytes.len() == DESTINATION_LENGTH {
+                let mut hash = [0u8; DESTINATION_LENGTH];
+                hash.copy_from_slice(address_hash_bytes);
+                Some(hash)
+            } else {
+                None
+            };
+
+            match &event.event {
+                LinkEvent::Data { .. } => {
+                    // Data event means link is active - update last_activity_ms
+                    // This matches Python: link.no_data_for() resets when data is received
+                    // Update by link_id first, then by address_hash if different
+                    self.link_tracker.update_link_activity(link_id, now_ms);
+                    if let Some(addr_hash) = address_hash {
+                        if addr_hash != link_id {
+                            self.link_tracker.update_link_activity(addr_hash, now_ms);
+                        }
+                    }
+                }
+                LinkEvent::Activated => {
+                    // Link activated - ensure it's tracked
+                    // For direct links, we track by address_hash (matching Python behavior)
+                    if let Some(addr_hash) = address_hash {
+                        // Only add if not already tracked (to avoid overwriting existing state)
+                        if !self.link_tracker.has_direct_link(&addr_hash) {
+                            self.link_tracker.add_direct_link(addr_hash, now_ms);
+                        } else {
+                            // Update activity for existing link
+                            self.link_tracker.update_link_activity(addr_hash, now_ms);
+                        }
+                    }
+                }
+                LinkEvent::Closed => {
+                    // Link closed - mark as closed (matching Python: link.status == CLOSED)
+                    // Check if this is our outbound propagation link
+                    if let Some(ref mut outbound_link) = self.link_tracker.outbound_propagation_link {
+                        if outbound_link.link_id == link_id {
+                            outbound_link.is_closed = true;
+                        }
+                    }
+                    // Also mark in active_propagation_links if present
+                    for link_info in &mut self.link_tracker.active_propagation_links {
+                        if link_info.link_id == link_id {
+                            link_info.is_closed = true;
+                        }
+                    }
+                    // Mark direct links as closed (they will be cleaned by clean_links)
+                    if let Some(addr_hash) = address_hash {
+                        // Direct links are removed when inactive, so we just mark activity
+                        // The clean_links() will handle removal based on inactivity
+                    }
+                }
+            }
+        }
     }
 
     pub fn has_direct_link(&self, link_id: &[u8; DESTINATION_LENGTH]) -> bool {
@@ -1357,10 +1520,22 @@ impl LxmfRouter {
         source_hash: Option<[u8; DESTINATION_LENGTH]>,
         count_client_receive: bool,
     ) -> Option<[u8; 32]> {
+        // Extract destination_hash from lxm_data (first DESTINATION_LENGTH bytes, matching Python)
+        let destination_hash = if lxm_data.len() >= DESTINATION_LENGTH {
+            let mut hash = [0u8; DESTINATION_LENGTH];
+            hash.copy_from_slice(&lxm_data[..DESTINATION_LENGTH]);
+            Some(hash)
+        } else {
+            None
+        };
+
         let mut entry = PropagationEntry {
             transient_id: crate::rns::full_hash(&lxm_data),
             lxm_data: lxm_data.clone(),
             timestamp,
+            destination_hash,
+            filepath: None, // Will be set when saved to disk
+            msg_size: Some(lxm_data.len() as u64),
         };
 
         if let Some(validation) = self.propagation_validation {

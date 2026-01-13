@@ -29,6 +29,12 @@ pub struct PropagationEntry {
     pub transient_id: [u8; 32],
     pub lxm_data: Vec<u8>,
     pub timestamp: f64,
+    // Additional fields matching Python propagation_entries[transient_id] structure
+    pub destination_hash: Option<[u8; DESTINATION_LENGTH]>, // Index 0 in Python
+    pub filepath: Option<String>,                          // Index 1 in Python
+    pub msg_size: Option<u64>,                              // Index 3 in Python
+    // Note: handled_peers (index 4) and unhandled_peers (index 5) are stored separately in PropagationStore
+    // Note: stamp_value (index 6) is stored separately in PropagationStore.stamp_values
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -488,11 +494,24 @@ impl FileMessageStore {
                 continue;
             }
 
+            let msg_size = data.len() as u64;
+            // Extract destination_hash from lxm_data (first DESTINATION_LENGTH bytes, matching Python)
+            let destination_hash = if data.len() >= DESTINATION_LENGTH {
+                let mut hash = [0u8; DESTINATION_LENGTH];
+                hash.copy_from_slice(&data[..DESTINATION_LENGTH]);
+                Some(hash)
+            } else {
+                None
+            };
+
             store.insert_with_stamp_value_and_filename(
                 PropagationEntry {
                     transient_id,
                     lxm_data: data,
                     timestamp,
+                    destination_hash,
+                    filepath: Some(filename.to_string()),
+                    msg_size: Some(msg_size),
                 },
                 stamp_value,
                 filename.to_string(),
@@ -979,11 +998,32 @@ fn propagation_entry_filename(
 }
 
 fn propagation_entry_to_value(entry: &PropagationEntry) -> Value {
-    Value::Array(vec![
+    // Match Python structure: [destination_hash, filepath, received, msg_size, handled_peers, unhandled_peers, stamp_value]
+    // Note: handled_peers and unhandled_peers are stored separately in PropagationStore
+    // Note: stamp_value is stored separately in PropagationStore.stamp_values
+    // For serialization, we use: [transient_id, lxm_data, timestamp, destination_hash?, filepath?, msg_size?]
+    // This is a simplified format for wire transfer; full structure is maintained in memory
+    let mut arr = vec![
         Value::Binary(entry.transient_id.to_vec()),
         Value::Binary(entry.lxm_data.clone()),
         Value::F64(entry.timestamp),
-    ])
+    ];
+    
+    // Add optional fields if present (for backward compatibility, old format has only 3 fields)
+    arr.push(match entry.destination_hash {
+        Some(ref dest_hash) => Value::Binary(dest_hash.to_vec()),
+        None => Value::Nil,
+    });
+    arr.push(match &entry.filepath {
+        Some(ref path) => Value::String(path.clone().into()),
+        None => Value::Nil,
+    });
+    arr.push(match entry.msg_size {
+        Some(size) => Value::from(size as i64),
+        None => Value::Nil,
+    });
+    
+    Value::Array(arr)
 }
 
 fn propagation_entry_from_value(value: &Value) -> Result<PropagationEntry, RnsError> {
@@ -1007,10 +1047,52 @@ fn propagation_entry_from_value(value: &Value) -> Result<PropagationEntry, RnsEr
             .ok_or_else(|| RnsError::Msgpack("invalid timestamp".to_string()))?,
         _ => return Err(RnsError::Msgpack("invalid timestamp".to_string())),
     };
+    // Parse additional fields if present (for backward compatibility, old format has only 3 fields)
+    // Format: [transient_id, lxm_data, timestamp, destination_hash?, filepath?, msg_size?]
+    let mut destination_hash = if arr.len() > 3 {
+        match &arr[3] {
+            Value::Nil => None,
+            _ => value_to_fixed_bytes::<DESTINATION_LENGTH>(&arr[3]),
+        }
+    } else {
+        None
+    };
+    
+    // If destination_hash is not in serialized data, extract it from lxm_data (matching Python behavior)
+    if destination_hash.is_none() && lxm_data.len() >= DESTINATION_LENGTH {
+        let mut hash = [0u8; DESTINATION_LENGTH];
+        hash.copy_from_slice(&lxm_data[..DESTINATION_LENGTH]);
+        destination_hash = Some(hash);
+    }
+    
+    let filepath = if arr.len() > 4 {
+        match &arr[4] {
+            Value::Nil => None,
+            _ => value_to_opt_string(&arr[4]),
+        }
+    } else {
+        None
+    };
+    
+    let msg_size = if arr.len() > 5 {
+        match &arr[5] {
+            Value::Nil => None,
+            _ => value_to_opt_u64(&arr[5]),
+        }
+    } else {
+        None
+    };
+    
+    // If msg_size is not in serialized data, calculate it from lxm_data
+    let msg_size = msg_size.or(Some(lxm_data.len() as u64));
+
     Ok(PropagationEntry {
         transient_id,
         lxm_data,
         timestamp,
+        destination_hash,
+        filepath,
+        msg_size,
     })
 }
 

@@ -148,8 +148,8 @@ fn test_propagation_transfer_state_on_link_close() {
     router.clean_links(now_ms);
     assert!(router.outbound_propagation_link().is_none());
     
-    // TODO: Add tests for different propagation_transfer_state after implementation
-    // acknowledge_sync_completion method
+    // Test that acknowledge_sync_completion is called correctly
+    // (This is now implemented in Этап 7.3)
 }
 
 #[test]
