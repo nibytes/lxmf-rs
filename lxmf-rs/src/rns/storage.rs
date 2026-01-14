@@ -50,6 +50,10 @@ pub struct PropagationStore {
     entries: HashMap<[u8; 32], PropagationEntry>,
     stamp_values: HashMap<[u8; 32], u32>,
     filenames: HashMap<[u8; 32], String>,
+    // Handled and unhandled peers (matching Python propagation_entries structure)
+    // transient_id -> set of peer_ids
+    pub handled_peers: HashMap<[u8; 32], std::collections::HashSet<[u8; DESTINATION_LENGTH]>>,
+    pub unhandled_peers: HashMap<[u8; 32], std::collections::HashSet<[u8; DESTINATION_LENGTH]>>,
 }
 
 impl PropagationStore {
@@ -58,6 +62,8 @@ impl PropagationStore {
             entries: HashMap::new(),
             stamp_values: HashMap::new(),
             filenames: HashMap::new(),
+            handled_peers: HashMap::new(),
+            unhandled_peers: HashMap::new(),
         }
     }
 
@@ -135,9 +141,104 @@ impl PropagationStore {
         for id in &remove {
             self.stamp_values.remove(id);
             self.filenames.remove(id);
+            self.handled_peers.remove(id);
+            self.unhandled_peers.remove(id);
             self.entries.remove(id);
         }
         remove.len()
+    }
+
+    // Methods for managing handled/unhandled peers (matching Python LXMRouter propagation_entries structure)
+    
+    /// Add peer to handled_peers for a transient_id (matching Python propagation_entries[transient_id][4])
+    /// Python: if not self.destination_hash in self.router.propagation_entries[transient_id][4]: append
+    pub fn add_handled_peer(&mut self, transient_id: &[u8; 32], peer_id: [u8; DESTINATION_LENGTH]) -> bool {
+        if self.entries.contains_key(transient_id) {
+            // Python checks: if not peer_id in list, then append (HashSet.insert returns false if already exists)
+            let was_new = self.handled_peers
+                .entry(*transient_id)
+                .or_insert_with(std::collections::HashSet::new)
+                .insert(peer_id);
+            was_new
+        } else {
+            false
+        }
+    }
+
+    /// Remove peer from handled_peers for a transient_id
+    /// Python: if transient_id in propagation_entries and peer_id in list[4]: remove
+    pub fn remove_handled_peer(&mut self, transient_id: &[u8; 32], peer_id: &[u8; DESTINATION_LENGTH]) {
+        // Python checks: if transient_id in propagation_entries and peer_id in list[4]
+        // We check entry existence for consistency, but removal is safe even if entry doesn't exist
+        if self.entries.contains_key(transient_id) {
+            if let Some(peers) = self.handled_peers.get_mut(transient_id) {
+                peers.remove(peer_id);
+                if peers.is_empty() {
+                    self.handled_peers.remove(transient_id);
+                }
+            }
+        }
+    }
+
+    /// Check if peer is in handled_peers for a transient_id
+    pub fn is_peer_handled(&self, transient_id: &[u8; 32], peer_id: &[u8; DESTINATION_LENGTH]) -> bool {
+        self.handled_peers
+            .get(transient_id)
+            .map_or(false, |peers| peers.contains(peer_id))
+    }
+
+    /// Add peer to unhandled_peers for a transient_id (matching Python propagation_entries[transient_id][5])
+    /// Python: if transient_id in propagation_entries and not peer_id in list[5]: append
+    pub fn add_unhandled_peer(&mut self, transient_id: &[u8; 32], peer_id: [u8; DESTINATION_LENGTH]) -> bool {
+        if self.entries.contains_key(transient_id) {
+            // Python checks: if not peer_id in list, then append (HashSet.insert returns false if already exists)
+            self.unhandled_peers
+                .entry(*transient_id)
+                .or_insert_with(std::collections::HashSet::new)
+                .insert(peer_id)
+        } else {
+            false
+        }
+    }
+
+    /// Remove peer from unhandled_peers for a transient_id
+    /// Python: if transient_id in propagation_entries and peer_id in list[5]: remove
+    pub fn remove_unhandled_peer(&mut self, transient_id: &[u8; 32], peer_id: &[u8; DESTINATION_LENGTH]) {
+        // Python checks: if transient_id in propagation_entries and peer_id in list[5]
+        // We check entry existence for consistency, but removal is safe even if entry doesn't exist
+        if self.entries.contains_key(transient_id) {
+            if let Some(peers) = self.unhandled_peers.get_mut(transient_id) {
+                peers.remove(peer_id);
+                if peers.is_empty() {
+                    self.unhandled_peers.remove(transient_id);
+                }
+            }
+        }
+    }
+
+    /// Check if peer is in unhandled_peers for a transient_id
+    pub fn is_peer_unhandled(&self, transient_id: &[u8; 32], peer_id: &[u8; DESTINATION_LENGTH]) -> bool {
+        self.unhandled_peers
+            .get(transient_id)
+            .map_or(false, |peers| peers.contains(peer_id))
+    }
+
+    /// Get all transient_ids where peer is in handled_peers (matching Python peer.handled_messages)
+    pub fn handled_messages_for_peer(&self, peer_id: [u8; DESTINATION_LENGTH]) -> Vec<[u8; 32]> {
+        self.handled_peers
+            .iter()
+            .filter(|(_, peers)| peers.contains(&peer_id))
+            .map(|(transient_id, _)| *transient_id)
+            .collect()
+    }
+
+    /// Get all transient_ids where peer is in unhandled_peers (matching Python peer.unhandled_messages)
+    pub fn unhandled_messages_for_peer(&self, peer_id: [u8; DESTINATION_LENGTH]) -> Vec<[u8; 32]> {
+        self.unhandled_peers
+            .iter()
+            .filter(|(_, peers)| peers.contains(&peer_id))
+            .map(|(transient_id, _)| *transient_id)
+            .collect()
     }
 }
 

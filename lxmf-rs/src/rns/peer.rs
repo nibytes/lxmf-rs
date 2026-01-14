@@ -223,6 +223,50 @@ impl Peer {
         &self.handled_messages_queue
     }
 
+    /// Process queues (matching Python LXMPeer.process_queues)
+    /// Moves transient_ids from queues to PropagationStore handled/unhandled_peers
+    /// 
+    /// Python logic:
+    /// - For handled_messages_queue: if not in handled_messages, add to handled; if in unhandled_messages, remove from unhandled
+    /// - For unhandled_messages_queue: if not in handled_messages AND not in unhandled_messages, add to unhandled
+    pub fn process_queues(&mut self, store: &mut super::storage::PropagationStore) {
+        // Get current state (matching Python: handled_messages = self.handled_messages)
+        let handled_messages: std::collections::HashSet<[u8; 32]> = 
+            store.handled_messages_for_peer(self.id).into_iter().collect();
+        let unhandled_messages: std::collections::HashSet<[u8; 32]> = 
+            store.unhandled_messages_for_peer(self.id).into_iter().collect();
+        
+        // Process handled_messages_queue (matching Python lines 558-561)
+        while let Some(transient_id) = self.handled_messages_queue.pop_front() {
+            // Python: if not transient_id in handled_messages: self.add_handled_message(transient_id)
+            if !handled_messages.contains(&transient_id) {
+                store.add_handled_peer(&transient_id, self.id);
+            }
+            // Python: if transient_id in unhandled_messages: self.remove_unhandled_message(transient_id)
+            if unhandled_messages.contains(&transient_id) {
+                store.remove_unhandled_peer(&transient_id, &self.id);
+            }
+        }
+        
+        // Process unhandled_messages_queue (matching Python lines 563-566)
+        while let Some(transient_id) = self.unhandled_messages_queue.pop_front() {
+            // Python: if not transient_id in handled_messages and not transient_id in unhandled_messages: self.add_unhandled_message(transient_id)
+            if !handled_messages.contains(&transient_id) && !unhandled_messages.contains(&transient_id) {
+                store.add_unhandled_peer(&transient_id, self.id);
+            }
+        }
+    }
+
+    /// Get handled messages for this peer (matching Python peer.handled_messages)
+    pub fn handled_messages(&self, store: &super::storage::PropagationStore) -> Vec<[u8; 32]> {
+        store.handled_messages_for_peer(self.id)
+    }
+
+    /// Get unhandled messages for this peer (matching Python peer.unhandled_messages)
+    pub fn unhandled_messages(&self, store: &super::storage::PropagationStore) -> Vec<[u8; 32]> {
+        store.unhandled_messages_for_peer(self.id)
+    }
+
     pub fn should_sync(&self, now_ms: u64) -> bool {
         matches!(self.state, PeerState::Idle | PeerState::Backoff) && now_ms >= self.next_sync_ms
     }
