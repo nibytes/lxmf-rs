@@ -14,7 +14,7 @@
 - ✅ Updated `remove_older_than()` to also clean up `handled_peers` and `unhandled_peers`
 - ✅ Written 7 comprehensive tests in `tests/rns_peer_queue_processing.rs`, all passing
 
-**Note**: The call to `peer.process_queues()` in `flush_queues()` is commented out - marked as "would be implemented separately" for now. The functionality is fully implemented and tested.
+**Note**: ✅ The call to `peer.process_queues()` in `flush_queues()` is now integrated and active, matching Python behavior.
 
 ### Этап 7.2: Propagation Entries Structure ✅
 **Status**: Fully implemented and tested

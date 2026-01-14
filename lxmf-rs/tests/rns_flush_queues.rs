@@ -197,3 +197,92 @@ fn test_flush_calls_queue_unhandled_message() {
     assert!(peer.unhandled_messages_queue().contains(&transient_id));
     assert_eq!(peer.unhandled_messages_queue().len(), 1);
 }
+
+#[test]
+fn test_flush_queues_processes_peer_queues() {
+    let mut router = make_router();
+    let now_ms = 1_700_000_000_000u64;
+    
+    // Add peer
+    let peer_id = make_peer_id(0x01);
+    router.upsert_peer(peer_id, now_ms);
+    
+    // Add propagation entry
+    let transient_id = make_transient_id(0xAA);
+    use lxmf_rs::PropagationEntry;
+    let entry = PropagationEntry {
+        transient_id,
+        lxm_data: vec![1, 2, 3, 4],
+        timestamp: 1.0,
+        destination_hash: None,
+        filepath: None,
+        msg_size: None,
+    };
+    router.propagation_store_mut().insert(entry);
+    
+    // Add transient_id to peer's unhandled_messages_queue
+    router.peers_mut().get_mut(&peer_id).unwrap().queue_unhandled_message(transient_id);
+    
+    // Verify queue is not empty
+    let peer = router.peers().get(&peer_id).unwrap();
+    assert!(peer.queued_items());
+    assert_eq!(peer.unhandled_messages_queue().len(), 1);
+    
+    // Call flush_queues (should process queues)
+    router.flush_queues();
+    
+    // Verify that process_queues was called:
+    // 1. Queue should be empty
+    let peer = router.peers().get(&peer_id).unwrap();
+    assert_eq!(peer.unhandled_messages_queue().len(), 0);
+    
+    // 2. Peer should be in unhandled_peers for this transient_id
+    assert!(router.propagation_store().is_peer_unhandled(&transient_id, &peer_id));
+}
+
+#[test]
+fn test_flush_queues_processes_handled_messages() {
+    let mut router = make_router();
+    let now_ms = 1_700_000_000_000u64;
+    
+    // Add peer
+    let peer_id = make_peer_id(0x01);
+    router.upsert_peer(peer_id, now_ms);
+    
+    // Add propagation entry
+    let transient_id = make_transient_id(0xBB);
+    use lxmf_rs::PropagationEntry;
+    let entry = PropagationEntry {
+        transient_id,
+        lxm_data: vec![1, 2, 3, 4],
+        timestamp: 1.0,
+        destination_hash: None,
+        filepath: None,
+        msg_size: None,
+    };
+    router.propagation_store_mut().insert(entry);
+    
+    // First, add to unhandled (simulating initial state)
+    router.peers_mut().get_mut(&peer_id).unwrap().queue_unhandled_message(transient_id);
+    router.flush_queues();
+    
+    // Verify peer is in unhandled_peers
+    assert!(router.propagation_store().is_peer_unhandled(&transient_id, &peer_id));
+    
+    // Now add to handled_messages_queue (simulating message was handled)
+    router.peers_mut().get_mut(&peer_id).unwrap().queue_handled_message(transient_id);
+    
+    // Call flush_queues (should process queues)
+    router.flush_queues();
+    
+    // Verify that process_queues was called:
+    // 1. Handled queue should be empty
+    let peer = router.peers().get(&peer_id).unwrap();
+    assert_eq!(peer.handled_messages_queue().len(), 0);
+    
+    // 2. Peer should be in handled_peers
+    assert!(router.propagation_store().is_peer_handled(&transient_id, &peer_id));
+    
+    // 3. Peer should NOT be in unhandled_peers (removed when added to handled)
+    assert!(!router.propagation_store().is_peer_unhandled(&transient_id, &peer_id));
+}

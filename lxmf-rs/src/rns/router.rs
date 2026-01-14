@@ -2695,8 +2695,7 @@ impl LxmfRouter {
         for peer_id in peer_ids {
             if let Some(peer) = self.peers.entries_mut().get_mut(&peer_id) {
                 if peer.queued_items() {
-                    // peer.process_queues() - would be implemented separately
-                    // For now, we just mark that queues need processing
+                    peer.process_queues(&mut self.propagation_store);
                 }
             }
         }
