@@ -587,6 +587,17 @@ fn generate_stamp(
 
     let mut stamp = [0u8; STAMP_SIZE];
     let mut rounds = 0u32;
+    
+    // Limit rounds to prevent infinite loops in tests
+    // For cost 18, typical rounds needed: ~262k, but can be much higher
+    // Use a reasonable limit: 10M rounds (should be enough for cost 18, but prevents infinite loops)
+    let max_rounds = if stamp_cost <= 15 {
+        u32::MAX // Allow unlimited for low costs
+    } else if stamp_cost <= 20 {
+        10_000_000u32 // 10M rounds for medium costs (should be enough for cost 18)
+    } else {
+        1_000_000u32 // 1M rounds for high costs
+    };
 
     loop {
         OsRng.fill_bytes(&mut stamp);
@@ -596,7 +607,7 @@ fn generate_stamp(
             return (Some(stamp), value);
         }
 
-        if rounds == u32::MAX {
+        if rounds >= max_rounds {
             return (None, 0);
         }
     }

@@ -108,7 +108,6 @@ fn test_full_daemon_cycle() {
 }
 
 #[test]
-#[ignore] // TODO: Fix hang - test was hanging before our changes
 fn test_daemon_with_real_router() {
     let mut router = make_router();
     let now_ms = 1_700_000_000_000u64;
