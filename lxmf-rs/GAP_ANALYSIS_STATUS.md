@@ -61,6 +61,31 @@
 - Added caching check in `schedule_peer_sync()` to reuse existing peering_key when available
 **Result**: Test now passes in ~0.27 seconds
 
+## Detailed Comparison Results
+
+A comprehensive field-by-field comparison has been performed (see `DETAILED_COMPARISON.md`). Key findings:
+
+### Missing Critical Fields (High Priority)
+1. **`retain_synced_on_node`** - Flag to retain synced messages on node
+2. **`enforce_ratchets`** - Ratchet enforcement flag
+3. **`default_sync_strategy`** - Default peer sync strategy
+4. **`processing_inbound`** - Processing state flag
+5. **`name`** - Router name/identifier
+6. **`outbound_propagation_node`** - Direct storage of outbound propagation node hash
+7. **`propagation_transfer_last_duplicates`** - Last transfer duplicates count
+8. **`propagation_transfer_max_messages`** - Max messages for transfer
+9. **`propagation_destination`** - RNS Destination object for propagation
+10. **`control_destination`** - RNS Destination object for control
+11. **`autopeer`** - Autopeer flag
+
+### Medium Priority Missing Fields
+- `delivery_destinations` - Used only for announce() method
+- `ratchetpath` - For future ratchet support
+- `information_storage_limit` - Separate from message storage
+
+### Fields That Exist But May Need Review
+- `validated_peer_links` - Exists in Rust `LinkTracker` but usage may differ from Python
+
 ## Remaining Gaps (from original plan)
 
 
@@ -128,3 +153,41 @@
   - 9 existing tests for link lifecycle (all passing)
 - ✅ All existing tests passing (including `test_daemon_with_real_router` which was fixed)
 - ✅ Fixed 2 failing tests in `rns_router_pipeline` (they were broken before our changes)
+
+## Full Comparison Completed
+
+**See**:
+- `DETAILED_COMPARISON.md` - Detailed LXMRouter comparison (334 lines)
+- `FULL_COMPARISON.md` - Complete component-by-component comparison (549 lines)
+- `IMPLEMENTATION_PLAN.md` - Comprehensive implementation plan with priorities
+
+### Component Coverage Summary
+
+| Component | Fields | Methods | Constants | Overall |
+|-----------|--------|---------|-----------|---------|
+| **LXMRouter** | ~70% | ~25% | ~57% | ~51% |
+| **LXMPeer** | ~40% | ~30% | ~20% | ~30% |
+| **LXMessage** | ~50% | ~60% | ~70% | ~60% |
+| **LXStamper** | N/A | ~40% | ~80% | ~60% |
+| **LXMF.py** | N/A | ~80% | ~60% | ~70% |
+| **Handlers** | N/A | ~70% | N/A | ~70% |
+
+### Critical Missing Features (P0)
+
+1. **LXMRouter**: 11 critical fields missing (name, autopeer, outbound_propagation_node, etc.)
+2. **LXMRouter**: ~64 methods missing (announce, propagation node management, etc.)
+3. **LXMPeer**: ~15 fields missing (sync_strategy, peering_cost, propagation limits, etc.)
+4. **LXMPeer**: ~10 methods missing (sync(), generate_peering_key(), link callbacks, etc.)
+5. **LXMessage**: Convenience methods missing (title_as_string, content_as_string, etc.)
+
+### Next Implementation Stages
+
+See `IMPLEMENTATION_PLAN.md` for detailed plan of missing features.
+
+**Priority**: Start with Phase 1 (P0) features - Foundation (~15-20 hours estimated)
+
+**Phases**:
+- **Phase 1 (P0)**: Foundation - ~15-20 hours
+- **Phase 2 (P1)**: Core Features - ~20-25 hours
+- **Phase 3 (P2)**: Advanced Features - ~15-25 hours
+- **Phase 4 (P3)**: Optional Features - ~1-2 hours

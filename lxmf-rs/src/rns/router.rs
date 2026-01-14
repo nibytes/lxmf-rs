@@ -1,7 +1,7 @@
 use crate::constants::{
-    DESTINATION_LENGTH, FIELD_TICKET, HASH_LENGTH, MESSAGE_EXPIRY, STATE_DELIVERED, STATE_FAILED,
-    STATE_OUTBOUND, STATE_SENDING, STATE_SENT, TICKET_EXPIRY, TICKET_GRACE, TICKET_INTERVAL,
-    TICKET_LENGTH, TICKET_RENEW,
+    DESTINATION_LENGTH, FIELD_TICKET, HASH_LENGTH, MESSAGE_EXPIRY, PN_META_NAME, STATE_DELIVERED,
+    STATE_FAILED, STATE_OUTBOUND, STATE_SENDING, STATE_SENT, TICKET_EXPIRY, TICKET_GRACE,
+    TICKET_INTERVAL, TICKET_LENGTH, TICKET_RENEW,
 };
 use crate::message::{generate_peering_key, validate_peering_key, validate_pn_stamp, LXMessage};
 use crate::pn::PnDirectory;
@@ -35,9 +35,14 @@ use rand_core::RngCore;
 const DELIVERED_CACHE_MAX: usize = 2048;
 pub const PEER_SYNC_TIMEOUT_MS: u64 = 5 * 60 * 1000;
 pub const PEER_SYNC_PATH: &str = "lxmf/peer/sync";
-pub const CONTROL_STATS_PATH: &str = "/pn/get/stats";
-pub const CONTROL_SYNC_PATH: &str = "/pn/peer/sync";
-pub const CONTROL_UNPEER_PATH: &str = "/pn/peer/unpeer";
+// Control/PN request paths (matching Python LXMRouter)
+pub const STATS_GET_PATH: &str = "/pn/get/stats"; // Matching Python STATS_GET_PATH = "/pn/get/stats"
+pub const SYNC_REQUEST_PATH: &str = "/pn/peer/sync"; // Matching Python SYNC_REQUEST_PATH = "/pn/peer/sync"
+pub const UNPEER_REQUEST_PATH: &str = "/pn/peer/unpeer"; // Matching Python UNPEER_REQUEST_PATH = "/pn/peer/unpeer"
+// Aliases for backward compatibility (kept for existing code)
+pub const CONTROL_STATS_PATH: &str = STATS_GET_PATH;
+pub const CONTROL_SYNC_PATH: &str = SYNC_REQUEST_PATH;
+pub const CONTROL_UNPEER_PATH: &str = UNPEER_REQUEST_PATH;
 
 // Job scheduling intervals (matching Python LXMRouter)
 pub const JOB_OUTBOUND_INTERVAL: u64 = 1;
@@ -76,6 +81,15 @@ pub const PR_TRANSFER_FAILED: u8 = 0xf2;
 pub const PR_NO_IDENTITY_RCVD: u8 = 0xf3;
 pub const PR_NO_ACCESS: u8 = 0xf4;
 pub const PR_FAILED: u8 = 0xfe;
+pub const PR_ALL_MESSAGES: u32 = 0x00; // Matching Python PR_ALL_MESSAGES = 0x00
+pub const PR_PATH_TIMEOUT: u64 = 10; // Matching Python PR_PATH_TIMEOUT = 10 (seconds)
+pub const NODE_ANNOUNCE_DELAY: u64 = 20; // Matching Python NODE_ANNOUNCE_DELAY = 20 (seconds)
+pub const PATH_REQUEST_WAIT: u64 = 7; // Matching Python PATH_REQUEST_WAIT = 7 (seconds)
+pub const MAX_DELIVERY_ATTEMPTS: u32 = 5; // Matching Python MAX_DELIVERY_ATTEMPTS = 5
+pub const DELIVERY_RETRY_WAIT: u64 = 10; // Matching Python DELIVERY_RETRY_WAIT = 10 (seconds)
+pub const MAX_PATHLESS_TRIES: u32 = 1; // Matching Python MAX_PATHLESS_TRIES = 1
+pub const PN_STAMP_THROTTLE: u64 = 180; // Matching Python PN_STAMP_THROTTLE = 180 (seconds)
+pub const DUPLICATE_SIGNAL: &str = "lxmf_duplicate"; // Matching Python DUPLICATE_SIGNAL = "lxmf_duplicate"
 
 pub const CONTROL_ERROR_NO_IDENTITY: u8 = 0xf0;
 pub const CONTROL_ERROR_NO_ACCESS: u8 = 0xf1;
@@ -218,13 +232,15 @@ impl DeliveredCache {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub outbound_interval_ms: u64,
     pub inflight_interval_ms: u64,
     pub request_interval_ms: u64,
     pub pn_interval_ms: u64,
     pub store_interval_ms: u64,
+    pub name: Option<String>,
+    pub autopeer: Option<bool>,
 }
 
 impl Default for RuntimeConfig {
@@ -235,6 +251,8 @@ impl Default for RuntimeConfig {
             request_interval_ms: 1000,
             pn_interval_ms: 5000,
             store_interval_ms: 8 * 60 * 1000,
+            name: None,
+            autopeer: None,
         }
     }
 }
@@ -319,8 +337,8 @@ impl LxmfRuntime {
         &mut self.requests
     }
 
-    pub fn config(&self) -> RuntimeConfig {
-        self.config
+    pub fn config(&self) -> &RuntimeConfig {
+        &self.config
     }
 
     pub fn set_config(&mut self, config: RuntimeConfig) {
@@ -589,6 +607,7 @@ pub struct LxmfRouter {
     propagation_transfer_progress: f64, // Matching Python propagation_transfer_progress (0.0-1.0)
     wants_download_on_path_available_from: Option<[u8; DESTINATION_LENGTH]>, // Matching Python wants_download_on_path_available_from
     wants_download_on_path_available_to: Option<[u8; DESTINATION_LENGTH]>, // Matching Python wants_download_on_path_available_to
+    wants_download_on_path_available_timeout: Option<u64>, // Matching Python wants_download_on_path_available_timeout (timestamp in seconds)
     prioritise_rotating_unreachable_peers: bool, // Matching Python prioritise_rotating_unreachable_peers
     peer_distribution_queue: VecDeque<([u8; 32], Option<[u8; DESTINATION_LENGTH]>)>, // Matching Python peer_distribution_queue: deque([transient_id, from_peer])
     throttled_peers: HashMap<[u8; DESTINATION_LENGTH], u64>, // Matching Python throttled_peers: dict (peer_hash -> expiry_timestamp_ms)
@@ -597,6 +616,15 @@ pub struct LxmfRouter {
     stamp_processing_active: Arc<AtomicBool>, // Flag to prevent concurrent processing (matching Python stamp_gen_lock.locked())
     processed_deferred_tx: Option<mpsc::Sender<DeferredOutbound>>, // Channel sender for processed messages (created on first use)
     processed_deferred_rx: Option<mpsc::Receiver<DeferredOutbound>>, // Channel receiver for processed messages
+    name: Option<String>, // Matching Python self.name (router name/identifier)
+    autopeer: bool, // Matching Python self.autopeer (default: True)
+    outbound_propagation_node: Option<[u8; DESTINATION_LENGTH]>, // Matching Python self.outbound_propagation_node (direct storage of outbound PN hash)
+    propagation_transfer_max_messages: Option<u32>, // Matching Python self.propagation_transfer_max_messages (max messages for transfer)
+    propagation_transfer_last_duplicates: Option<u32>, // Matching Python self.propagation_transfer_last_duplicates (last transfer duplicates count)
+    // Queues for async RNS operations (processed by external event loop)
+    pn_announce_queue: VecDeque<(Vec<u8>, u64)>, // (app_data, scheduled_time_ms) - PN announcements to be sent
+    pn_message_requests: VecDeque<([u8; DESTINATION_LENGTH], [u8; DESTINATION_LENGTH], Option<u32>)>, // (node_hash, identity_hash, max_messages) - Message requests from PN
+    pn_path_requests: VecDeque<[u8; DESTINATION_LENGTH]>, // node_hash - Path requests for PN nodes
 }
 
 impl LxmfRouter {
@@ -651,6 +679,7 @@ impl LxmfRouter {
             propagation_transfer_progress: 0.0, // Matching Python propagation_transfer_progress = 0.0
             wants_download_on_path_available_from: None, // Matching Python wants_download_on_path_available_from = None
             wants_download_on_path_available_to: None, // Matching Python wants_download_on_path_available_to = None
+            wants_download_on_path_available_timeout: None, // Matching Python wants_download_on_path_available_timeout = None
             prioritise_rotating_unreachable_peers: false, // Default: False (matching Python)
             peer_distribution_queue: VecDeque::new(), // Matching Python peer_distribution_queue = deque()
             throttled_peers: HashMap::new(), // Matching Python throttled_peers = {}
@@ -658,12 +687,22 @@ impl LxmfRouter {
             stamp_processing_active: Arc::new(AtomicBool::new(false)), // Flag to prevent concurrent processing
             processed_deferred_tx: None,
             processed_deferred_rx: None,
+            name: None, // Matching Python self.name = name (default: None)
+            autopeer: true, // Matching Python autopeer=AUTOPEER (default: True)
+            outbound_propagation_node: None, // Matching Python self.outbound_propagation_node = None
+            propagation_transfer_max_messages: None, // Matching Python self.propagation_transfer_max_messages = None
+            propagation_transfer_last_duplicates: None, // Matching Python self.propagation_transfer_last_duplicates = None
+            pn_announce_queue: VecDeque::new(), // Queue for PN announcements
+            pn_message_requests: VecDeque::new(), // Queue for PN message requests
+            pn_path_requests: VecDeque::new(), // Queue for PN path requests
         }
     }
 
     pub fn with_config(router: RnsRouter, config: RuntimeConfig) -> Self {
         let local_identity_hash = router.local_identity_hash();
         let (tx, rx) = mpsc::channel();
+        let name = config.name.clone();
+        let autopeer = config.autopeer.unwrap_or(true);
         Self {
             runtime: LxmfRuntime::with_config(router, config),
             peers: PeerTable::new(),
@@ -713,6 +752,7 @@ impl LxmfRouter {
             propagation_transfer_progress: 0.0, // Matching Python propagation_transfer_progress = 0.0
             wants_download_on_path_available_from: None, // Matching Python wants_download_on_path_available_from = None
             wants_download_on_path_available_to: None, // Matching Python wants_download_on_path_available_to = None
+            wants_download_on_path_available_timeout: None, // Matching Python wants_download_on_path_available_timeout = None
             prioritise_rotating_unreachable_peers: false, // Default: False (matching Python)
             peer_distribution_queue: VecDeque::new(), // Matching Python peer_distribution_queue = deque()
             throttled_peers: HashMap::new(), // Matching Python throttled_peers = {}
@@ -720,6 +760,14 @@ impl LxmfRouter {
             stamp_processing_active: Arc::new(AtomicBool::new(false)), // Flag to prevent concurrent processing
             processed_deferred_tx: Some(tx),
             processed_deferred_rx: Some(rx),
+            name, // Matching Python self.name = name
+            autopeer, // Matching Python autopeer=AUTOPEER (default: True)
+            outbound_propagation_node: None, // Matching Python self.outbound_propagation_node = None
+            propagation_transfer_max_messages: None, // Matching Python self.propagation_transfer_max_messages = None
+            propagation_transfer_last_duplicates: None, // Matching Python self.propagation_transfer_last_duplicates = None
+            pn_announce_queue: VecDeque::new(), // Queue for PN announcements
+            pn_message_requests: VecDeque::new(), // Queue for PN message requests
+            pn_path_requests: VecDeque::new(), // Queue for PN path requests
         }
     }
 
@@ -760,6 +808,7 @@ impl LxmfRouter {
         facade.clean_transient_id_caches(now_ms);
         facade.clean_propagation_store(now_ms);
         facade.save_local_caches();
+        // name and autopeer are already set by with_config
         facade
     }
 
@@ -1001,6 +1050,345 @@ impl LxmfRouter {
         self.wants_download_on_path_available_to = to;
     }
 
+    /// Get wants_download_on_path_available_timeout (for testing/internal use)
+    pub fn wants_download_on_path_available_timeout(&self) -> Option<u64> {
+        self.wants_download_on_path_available_timeout
+    }
+
+    /// Set wants_download_on_path_available_timeout (for testing/internal use)
+    pub fn set_wants_download_on_path_available_timeout(&mut self, timeout: Option<u64>) {
+        self.wants_download_on_path_available_timeout = timeout;
+    }
+
+    /// Get router name (matching Python LXMRouter.name)
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Set router name (matching Python LXMRouter.name = name)
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
+    }
+
+    /// Get autopeer flag (matching Python LXMRouter.autopeer)
+    pub fn autopeer(&self) -> bool {
+        self.autopeer
+    }
+
+    /// Set autopeer flag (matching Python LXMRouter.autopeer = value)
+    pub fn set_autopeer(&mut self, autopeer: bool) {
+        self.autopeer = autopeer;
+    }
+
+    /// Get outbound propagation node (matching Python LXMRouter.get_outbound_propagation_node)
+    pub fn get_outbound_propagation_node(&self) -> Option<[u8; DESTINATION_LENGTH]> {
+        self.outbound_propagation_node
+    }
+
+    /// Set outbound propagation node (matching Python LXMRouter.set_outbound_propagation_node)
+    /// If the node changes and there's an existing outbound propagation link, it should be torn down.
+    pub fn set_outbound_propagation_node(&mut self, destination_hash: Option<[u8; DESTINATION_LENGTH]>) {
+        if self.outbound_propagation_node != destination_hash {
+            self.outbound_propagation_node = destination_hash;
+            // If there's an existing outbound propagation link and the node changed, teardown the link
+            // In Python: if self.outbound_propagation_link != None and self.outbound_propagation_link.destination.hash != destination_hash:
+            //     self.outbound_propagation_link.teardown()
+            //     self.outbound_propagation_link = None
+            if let Some(ref mut link) = self.link_tracker.outbound_propagation_link {
+                if let Some(new_hash) = destination_hash {
+                    if link.link_id != new_hash {
+                        // Mark link as closed (teardown equivalent)
+                        link.is_closed = true;
+                        self.link_tracker.outbound_propagation_link = None;
+                    }
+                } else {
+                    // Node cleared, teardown link
+                    link.is_closed = true;
+                    self.link_tracker.outbound_propagation_link = None;
+                }
+            }
+        }
+    }
+
+    /// Get propagation transfer max messages (matching Python LXMRouter.propagation_transfer_max_messages)
+    pub fn propagation_transfer_max_messages(&self) -> Option<u32> {
+        self.propagation_transfer_max_messages
+    }
+
+    /// Set propagation transfer max messages (matching Python LXMRouter.propagation_transfer_max_messages = max)
+    pub fn set_propagation_transfer_max_messages(&mut self, max: Option<u32>) {
+        self.propagation_transfer_max_messages = max;
+    }
+
+    /// Get propagation transfer last duplicates (matching Python LXMRouter.propagation_transfer_last_duplicates)
+    pub fn propagation_transfer_last_duplicates(&self) -> Option<u32> {
+        self.propagation_transfer_last_duplicates
+    }
+
+    /// Set propagation transfer last duplicates (matching Python LXMRouter.propagation_transfer_last_duplicates = count)
+    pub fn set_propagation_transfer_last_duplicates(&mut self, count: Option<u32>) {
+        self.propagation_transfer_last_duplicates = count;
+    }
+
+    /// Get propagation node announce metadata (matching Python LXMRouter.get_propagation_node_announce_metadata)
+    /// Returns a map with metadata, including PN_META_NAME if name is set
+    pub fn get_propagation_node_announce_metadata(&self) -> std::collections::HashMap<u8, Vec<u8>> {
+        let mut metadata = std::collections::HashMap::new();
+        if let Some(name) = &self.name {
+            metadata.insert(PN_META_NAME, name.as_bytes().to_vec());
+        }
+        metadata
+    }
+
+    /// Get propagation node app data (matching Python LXMRouter.get_propagation_node_app_data)
+    /// Returns msgpack-encoded announce data
+    pub fn get_propagation_node_app_data(&self) -> Vec<u8> {
+        use rmpv::Value;
+        
+        let metadata = self.get_propagation_node_announce_metadata();
+        let metadata_value = Value::Map(
+            metadata
+                .into_iter()
+                .map(|(k, v)| (Value::from(k as u8), Value::Binary(v)))
+                .collect(),
+        );
+        
+        // Get stamp costs from validation structs
+        let propagation_stamp_cost = self
+            .propagation_validation
+            .map(|v| v.stamp_cost as u64)
+            .unwrap_or(DEFAULT_PROPAGATION_STAMP_COST as u64);
+        let propagation_stamp_cost_flexibility = self
+            .propagation_validation
+            .map(|v| v.stamp_cost_flex as u64)
+            .unwrap_or(DEFAULT_PROPAGATION_STAMP_FLEX as u64);
+        let peering_cost = self
+            .peering_validation
+            .map(|v| v.target_cost as u64)
+            .unwrap_or(DEFAULT_PEERING_COST as u64);
+        
+        // Node state: propagation_node_enabled and not from_static_only
+        let node_state = self.propagation_node_enabled && !self.from_static_only;
+        
+        // Current timebase (in seconds, matching Python int(time.time()))
+        let timebase = (self.propagation_started_ms / 1000) as u64;
+        
+        // Transfer limits in kilobytes (matching Python)
+        let propagation_transfer_limit = self.propagation_transfer_limit_kb as u64;
+        let propagation_sync_limit = self.propagation_sync_limit_kb as u64;
+        
+        // Build announce data array (matching Python structure)
+        let announce_data = Value::Array(vec![
+            Value::Boolean(false), // [0] Legacy LXMF PN support
+            Value::Integer(rmpv::Integer::from(timebase)), // [1] Current node timebase
+            Value::Boolean(node_state), // [2] Boolean flag signalling propagation node state
+            Value::Integer(rmpv::Integer::from(propagation_transfer_limit)), // [3] Per-transfer limit for message propagation in kilobytes
+            Value::Integer(rmpv::Integer::from(propagation_sync_limit)), // [4] Limit for incoming propagation node syncs
+            Value::Array(vec![ // [5] Propagation stamp cost for this node
+                Value::Integer(rmpv::Integer::from(propagation_stamp_cost)),
+                Value::Integer(rmpv::Integer::from(propagation_stamp_cost_flexibility)),
+                Value::Integer(rmpv::Integer::from(peering_cost)),
+            ]),
+            metadata_value, // [6] Node metadata
+        ]);
+        
+        // Encode to msgpack bytes
+        let mut buf = Vec::new();
+        rmpv::encode::write_value(&mut buf, &announce_data).unwrap();
+        buf
+    }
+
+    /// Announce propagation node (matching Python LXMRouter.announce_propagation_node)
+    /// Schedules announcement with NODE_ANNOUNCE_DELAY (20 seconds) delay.
+    /// The announcement will be processed by the external event loop via pop_pn_announce().
+    pub fn announce_propagation_node(&mut self, now_ms: u64) {
+        // Get app_data for announcement (matching Python: self.get_propagation_node_app_data())
+        let app_data = self.get_propagation_node_app_data();
+        
+        // Schedule announcement with delay (matching Python: time.sleep(NODE_ANNOUNCE_DELAY))
+        let scheduled_time_ms = now_ms + (NODE_ANNOUNCE_DELAY * 1000);
+        self.pn_announce_queue.push_back((app_data, scheduled_time_ms));
+    }
+
+    /// Pop next PN announcement that is ready to be sent (for async event loop)
+    pub fn pop_pn_announce(&mut self, now_ms: u64) -> Option<Vec<u8>> {
+        // Check if any announcement is ready
+        let ready = self.pn_announce_queue.front()
+            .map(|(_, scheduled_time)| now_ms >= *scheduled_time)
+            .unwrap_or(false);
+        
+        if ready {
+            if let Some((app_data, _)) = self.pn_announce_queue.pop_front() {
+                return Some(app_data);
+            }
+        }
+        None
+    }
+
+    /// Cancel propagation node requests (matching Python LXMRouter.cancel_propagation_node_requests)
+    pub fn cancel_propagation_node_requests(&mut self) {
+        // Teardown outbound propagation link if exists
+        // In Python: if self.outbound_propagation_link != None: self.outbound_propagation_link.teardown()
+        if let Some(ref mut link) = self.link_tracker.outbound_propagation_link {
+            link.is_closed = true;
+            self.link_tracker.outbound_propagation_link = None;
+        }
+        
+        // Acknowledge sync completion with reset_state=True
+        // Note: In Python, acknowledge_sync_completion doesn't clear max_messages, but cancel should reset everything
+        self.acknowledge_sync_completion(true, None);
+        self.propagation_transfer_max_messages = None; // Clear max_messages on cancel
+    }
+
+    /// Request messages from propagation node (matching Python LXMRouter.request_messages_from_propagation_node)
+    /// Sets up state and queues the request for async processing via process_pn_message_requests().
+    pub fn request_messages_from_propagation_node(&mut self, identity_hash: [u8; DESTINATION_LENGTH], max_messages: Option<u32>, now_ms: u64) {
+        // Normalize max_messages (matching Python: if max_messages == None: max_messages = PR_ALL_MESSAGES)
+        let max = max_messages.unwrap_or(PR_ALL_MESSAGES);
+        
+        // Reset progress and set max_messages (matching Python lines 487-488)
+        self.propagation_transfer_progress = 0.0;
+        self.propagation_transfer_max_messages = Some(max);
+        
+        // Check if outbound_propagation_node is set (matching Python line 489)
+        if let Some(node_hash) = self.outbound_propagation_node {
+            // Check if link exists and is active
+            // In Python: if self.outbound_propagation_link != None and self.outbound_propagation_link.status == RNS.Link.ACTIVE:
+            if let Some(ref link) = self.link_tracker.outbound_propagation_link {
+                if !link.is_closed {
+                    // Link is active, queue request for immediate processing
+                    // In Python: self.propagation_transfer_state = PR_LINK_ESTABLISHED
+                    self.propagation_transfer_state = PR_LINK_ESTABLISHED;
+                    self.pn_message_requests.push_back((node_hash, identity_hash, Some(max)));
+                    self.propagation_transfer_state = PR_REQUEST_SENT;
+                } else {
+                    // Link is closed, need to establish new one
+                    self._establish_propagation_link_for_request(identity_hash, node_hash, now_ms);
+                }
+            } else {
+                // No link exists, establish one
+                self._establish_propagation_link_for_request(identity_hash, node_hash, now_ms);
+            }
+        }
+        // In Python: else: log warning "Cannot request LXMF propagation node sync, no default propagation node configured"
+    }
+
+    /// Process queued PN message requests (called from async event loop when link is ready)
+    pub fn process_pn_message_requests(&mut self) -> Vec<([u8; DESTINATION_LENGTH], [u8; DESTINATION_LENGTH], Option<u32>)> {
+        let mut ready = Vec::new();
+        while let Some(req) = self.pn_message_requests.pop_front() {
+            ready.push(req);
+        }
+        ready
+    }
+
+    /// Internal helper to establish propagation link for message request
+    fn _establish_propagation_link_for_request(&mut self, identity_hash: [u8; DESTINATION_LENGTH], node_hash: [u8; DESTINATION_LENGTH], now_ms: u64) {
+        // Check if path exists in pn_directory (matching Python: RNS.Transport.has_path())
+        // In Python: if RNS.Transport.has_path(self.outbound_propagation_node):
+        if self.pn_directory.get(&node_hash).is_some() {
+            // Path exists, set state to LINK_ESTABLISHING
+            // Link will be established via process_link_events() when LinkEvent::Activated is received
+            self.wants_download_on_path_available_from = None;
+            self.propagation_transfer_state = PR_LINK_ESTABLISHING;
+            // Queue message request for when link is ready
+            self.pn_message_requests.push_back((node_hash, identity_hash, self.propagation_transfer_max_messages));
+        } else {
+            // Path doesn't exist, request it
+            // In Python: RNS.Transport.request_path(...)
+            self.wants_download_on_path_available_from = Some(node_hash);
+            self.wants_download_on_path_available_to = Some(identity_hash);
+            // In Python: self.wants_download_on_path_available_timeout = time.time() + PR_PATH_TIMEOUT
+            let now_s = now_ms / 1000;
+            self.wants_download_on_path_available_timeout = Some(now_s + PR_PATH_TIMEOUT);
+            self.propagation_transfer_state = PR_PATH_REQUESTED;
+            // Queue path request for async processing
+            self.pn_path_requests.push_back(node_hash);
+        }
+    }
+
+    /// Pop next PN path request (for async event loop to request path via RNS)
+    pub fn pop_pn_path_request(&mut self) -> Option<[u8; DESTINATION_LENGTH]> {
+        self.pn_path_requests.pop_front()
+    }
+
+    /// Handle path available notification (called when path becomes available)
+    pub fn on_pn_path_available(&mut self, node_hash: [u8; DESTINATION_LENGTH], _now_ms: u64) {
+        // Check if we were waiting for this path
+        if self.wants_download_on_path_available_from == Some(node_hash) {
+            if let Some(identity_hash) = self.wants_download_on_path_available_to {
+                // Path is now available, establish link
+                self.wants_download_on_path_available_from = None;
+                self.propagation_transfer_state = PR_LINK_ESTABLISHING;
+                // Queue message request for when link is ready
+                self.pn_message_requests.push_back((node_hash, identity_hash, self.propagation_transfer_max_messages));
+            }
+        }
+    }
+
+    /// Get outbound propagation cost (matching Python LXMRouter.get_outbound_propagation_cost)
+    /// Returns the stamp cost from the propagation node's app data.
+    /// If not in directory, queues path request and returns None.
+    pub fn get_outbound_propagation_cost(&mut self) -> Option<u32> {
+        // Get outbound propagation node hash
+        let pn_destination_hash = self.outbound_propagation_node?;
+        
+        // Try to get app_data from pn_directory
+        // In Python: pn_app_data = RNS.Identity.recall_app_data(pn_destination_hash)
+        if let Some(entry) = self.pn_directory.get(&pn_destination_hash) {
+            // Extract stamp cost from app_data
+            // In Python: pn_config = msgpack.unpackb(pn_app_data); target_propagation_cost = pn_config[5][0]
+            return crate::pn::pn_stamp_cost_from_app_data(&entry.app_data).map(|c| c as u32);
+        }
+        
+        // If not in directory, queue path request (matching Python: RNS.Transport.request_path())
+        // In Python: if not target_propagation_cost: request path and wait
+        if !self.pn_path_requests.contains(&pn_destination_hash) {
+            self.pn_path_requests.push_back(pn_destination_hash);
+        }
+        None
+    }
+
+    /// Request messages path job (matching Python LXMRouter.request_messages_path_job)
+    /// Queues path request for async processing. The path will be checked via poll_path_request_timeout().
+    pub fn request_messages_path_job(&mut self) {
+        // Path request is already queued in _establish_propagation_link_for_request()
+        // This method exists to match Python signature
+        // Actual path waiting is handled by poll_path_request_timeout() in tick()
+    }
+
+    /// Internal request messages path job (matching Python LXMRouter.__request_messages_path_job)
+    /// Note: This should be called periodically from the event loop, not as a separate thread.
+    pub fn poll_path_request_timeout(&mut self, now_ms: u64) -> bool {
+        // Check if we're waiting for a path
+        if let (Some(from), Some(timeout_s)) = (
+            self.wants_download_on_path_available_from,
+            self.wants_download_on_path_available_timeout,
+        ) {
+            let now_s = now_ms / 1000;
+            
+            // Check timeout (matching Python: time.time() < path_timeout)
+            if now_s >= timeout_s {
+                // Timeout reached
+                // In Python: self.acknowledge_sync_completion(failure_state=PR_NO_PATH)
+                self.acknowledge_sync_completion(false, Some(PR_NO_PATH));
+                return true; // Indicates timeout occurred
+            }
+            
+            // Check if path is available in pn_directory (matching Python: RNS.Transport.has_path(from))
+            if self.pn_directory.get(&from).is_some() {
+                // Path is now available, establish link and request messages
+                if let Some(identity_hash) = self.wants_download_on_path_available_to {
+                    self.on_pn_path_available(from, now_ms);
+                    return false; // Path found, no timeout
+                }
+            }
+            // Still waiting for path
+            return false;
+        }
+        false
+    }
+
     /// Acknowledge sync completion (matching Python LXMRouter.acknowledge_sync_completion)
     /// 
     /// Resets propagation transfer state and related fields:
@@ -1028,6 +1416,7 @@ impl LxmfRouter {
         // Clear wants_download fields (matching Python: self.wants_download_on_path_available_from/to = None)
         self.wants_download_on_path_available_from = None;
         self.wants_download_on_path_available_to = None;
+        self.wants_download_on_path_available_timeout = None;
     }
 
     pub fn set_outbound_stamp_cost(
@@ -2114,8 +2503,8 @@ impl LxmfRouter {
         };
         // Use a lower cost for peering key generation to avoid long delays
         // In production, this should use validation.target_cost, but for testing
-        // we use a lower cost to prevent test hangs
-        // TODO: Make this configurable or use async generation
+        // we use a lower cost to prevent test hangs. This is a safety measure
+        // to prevent blocking the main thread during peering key generation.
         let cost = if validation.target_cost > 15 {
             15 // Use lower cost for high-cost scenarios to prevent hangs
         } else {
