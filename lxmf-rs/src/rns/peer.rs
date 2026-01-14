@@ -113,6 +113,7 @@ pub struct Peer {
     pub messages_incoming: u64,
     pub messages_unhandled: u64,
     pub peering_key: Option<Vec<u8>>,
+    pub sync_transfer_rate: f64, // Matching Python LXMPeer.sync_transfer_rate (transfer rate in bits per second)
     // Message queues (matching Python LXMPeer)
     pub(crate) handled_messages_queue: VecDeque<[u8; 32]>,   // Matching Python handled_messages_queue
     pub(crate) unhandled_messages_queue: VecDeque<[u8; 32]>, // Matching Python unhandled_messages_queue
@@ -136,9 +137,65 @@ impl Peer {
             messages_incoming: 0,
             messages_unhandled: 0,
             peering_key: None,
+            sync_transfer_rate: 0.0, // Matching Python: default sync_transfer_rate = 0
             handled_messages_queue: VecDeque::new(),
             unhandled_messages_queue: VecDeque::new(),
         }
+    }
+
+    /// Get sync_transfer_rate (matching Python LXMPeer.sync_transfer_rate)
+    pub fn sync_transfer_rate(&self) -> f64 {
+        self.sync_transfer_rate
+    }
+
+    /// Set sync_transfer_rate (matching Python LXMPeer.sync_transfer_rate)
+    pub fn set_sync_transfer_rate(&mut self, rate: f64) {
+        self.sync_transfer_rate = rate;
+    }
+
+    /// Check if peer is alive (matching Python LXMPeer.alive)
+    /// In Python: alive is a boolean field
+    /// In Rust: we derive it from state (not in Backoff = alive)
+    pub fn is_alive(&self) -> bool {
+        !matches!(self.state, PeerState::Backoff)
+    }
+
+    /// Set alive status (by updating state)
+    pub fn set_alive(&mut self, alive: bool) {
+        if !alive && matches!(self.state, PeerState::Idle) {
+            // Mark as backoff if setting to not alive
+            self.state = PeerState::Backoff;
+        } else if alive && matches!(self.state, PeerState::Backoff) {
+            // Mark as idle if setting to alive
+            self.state = PeerState::Idle;
+        }
+    }
+
+    /// Get last_heard_ms (matching Python LXMPeer.last_heard)
+    pub fn last_heard_ms(&self) -> u64 {
+        self.last_heard_ms
+    }
+
+    /// Set last_heard_ms (matching Python LXMPeer.last_heard)
+    pub fn set_last_heard_ms(&mut self, ms: u64) {
+        self.last_heard_ms = ms;
+    }
+
+    /// Get next_sync_attempt (matching Python LXMPeer.next_sync_attempt)
+    /// In Python: next_sync_attempt is a separate field
+    /// In Rust: we use next_sync_ms for the same purpose
+    pub fn next_sync_attempt_ms(&self) -> u64 {
+        self.next_sync_ms
+    }
+
+    /// Set next_sync_attempt (matching Python LXMPeer.next_sync_attempt)
+    pub fn set_next_sync_attempt_ms(&mut self, ms: u64) {
+        self.next_sync_ms = ms;
+    }
+
+    /// Get unhandled_messages count (matching Python len(peer.unhandled_messages))
+    pub fn unhandled_messages_count(&self) -> usize {
+        self.unhandled_messages_queue.len()
     }
 
     /// Queue unhandled message (matching Python LXMPeer.queue_unhandled_message)

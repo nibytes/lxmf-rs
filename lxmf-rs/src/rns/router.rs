@@ -57,6 +57,10 @@ pub const P_LINK_MAX_INACTIVITY: u64 = 3 * 60; // 3 minutes in seconds
 pub const ROTATION_HEADROOM_PCT: f64 = 10.0; // 10%
 pub const ROTATION_AR_MAX: f64 = 0.5; // 50% acceptance rate threshold
 
+// Peer sync constants (matching Python LXMRouter and LXMPeer)
+pub const FASTEST_N_RANDOM_POOL: usize = 2; // Number of fastest peers to randomly select from (matching Python LXMRouter.FASTEST_N_RANDOM_POOL)
+pub const MAX_UNREACHABLE: u64 = 14 * 24 * 60 * 60; // 14 days in seconds (matching Python LXMPeer.MAX_UNREACHABLE)
+
 // Propagation transfer state constants (matching Python LXMRouter)
 pub const PR_IDLE: u8 = 0x00;
 pub const PR_PATH_REQUESTED: u8 = 0x01;
@@ -587,6 +591,7 @@ pub struct LxmfRouter {
     wants_download_on_path_available_to: Option<[u8; DESTINATION_LENGTH]>, // Matching Python wants_download_on_path_available_to
     prioritise_rotating_unreachable_peers: bool, // Matching Python prioritise_rotating_unreachable_peers
     peer_distribution_queue: VecDeque<([u8; 32], Option<[u8; DESTINATION_LENGTH]>)>, // Matching Python peer_distribution_queue: deque([transient_id, from_peer])
+    throttled_peers: HashMap<[u8; DESTINATION_LENGTH], u64>, // Matching Python throttled_peers: dict (peer_hash -> expiry_timestamp_ms)
     // Thread-safe shared state for deferred stamp processing (matching Python stamp_gen_lock)
     deferred_outbound_shared: Arc<Mutex<VecDeque<DeferredOutbound>>>, // Shared queue for thread processing
     stamp_processing_active: Arc<AtomicBool>, // Flag to prevent concurrent processing (matching Python stamp_gen_lock.locked())
@@ -648,6 +653,7 @@ impl LxmfRouter {
             wants_download_on_path_available_to: None, // Matching Python wants_download_on_path_available_to = None
             prioritise_rotating_unreachable_peers: false, // Default: False (matching Python)
             peer_distribution_queue: VecDeque::new(), // Matching Python peer_distribution_queue = deque()
+            throttled_peers: HashMap::new(), // Matching Python throttled_peers = {}
             deferred_outbound_shared: Arc::new(Mutex::new(VecDeque::new())), // Shared queue for thread processing
             stamp_processing_active: Arc::new(AtomicBool::new(false)), // Flag to prevent concurrent processing
             processed_deferred_tx: None,
@@ -709,6 +715,7 @@ impl LxmfRouter {
             wants_download_on_path_available_to: None, // Matching Python wants_download_on_path_available_to = None
             prioritise_rotating_unreachable_peers: false, // Default: False (matching Python)
             peer_distribution_queue: VecDeque::new(), // Matching Python peer_distribution_queue = deque()
+            throttled_peers: HashMap::new(), // Matching Python throttled_peers = {}
             deferred_outbound_shared: Arc::new(Mutex::new(VecDeque::new())), // Shared queue for thread processing
             stamp_processing_active: Arc::new(AtomicBool::new(false)), // Flag to prevent concurrent processing
             processed_deferred_tx: Some(tx),
@@ -2109,12 +2116,141 @@ impl LxmfRouter {
     }
 
     fn schedule_peer_sync(&mut self, now_ms: u64) {
+        // Use simplified version for now (matching current implementation)
+        // Full sync_peers() logic is implemented separately
         let Some(peer_id) = self.next_peer_ready(now_ms) else {
             return;
         };
         let peering_key = self.peering_key_for_peer(peer_id);
         let req = self.peer_sync_offer(peer_id, peering_key, now_ms);
         self.peer_sync_queue.push_back((peer_id, req));
+    }
+
+    /// Sync peers (matching Python LXMRouter.sync_peers)
+    /// 
+    /// Selects peers for synchronization based on:
+    /// - Waiting peers: alive, IDLE, with unhandled_messages (sorted by sync_transfer_rate)
+    /// - Unresponsive peers: not alive, but with unhandled_messages and past next_sync_attempt
+    /// - Culled peers: older than MAX_UNREACHABLE (removed unless static)
+    /// 
+    /// Uses FASTEST_N_RANDOM_POOL to select from top-N fastest peers.
+    pub fn sync_peers(&mut self, now_ms: u64) {
+        let now_s = now_ms / 1000;
+        let max_unreachable_s = MAX_UNREACHABLE;
+        
+        let mut culled_peers = Vec::new();
+        let mut waiting_peers = Vec::new();
+        let mut unresponsive_peers = Vec::new();
+        
+        // Categorize peers (matching Python sync_peers logic)
+        let peer_ids: Vec<[u8; DESTINATION_LENGTH]> = self.peers.entries().keys().copied().collect();
+        for peer_id in peer_ids {
+            let peer = self.peers.get(&peer_id).expect("peer should exist");
+            let last_heard_s = peer.last_heard_ms() / 1000;
+            
+            // Check for culled peers (older than MAX_UNREACHABLE)
+            // In Python: if time.time() > peer.last_heard + LXMPeer.MAX_UNREACHABLE:
+            if now_s > last_heard_s.saturating_add(max_unreachable_s) {
+                if !self.static_peers.contains(&peer_id) {
+                    culled_peers.push(peer_id);
+                }
+                continue;
+            }
+            
+            // Check for waiting/unresponsive peers
+            // In Python: if peer.state == LXMPeer.IDLE and len(peer.unhandled_messages) > 0:
+            if matches!(peer.state, PeerState::Idle) && peer.unhandled_messages_count() > 0 {
+                // In Python: if peer.alive: waiting_peers.append(peer)
+                if peer.is_alive() {
+                    waiting_peers.push(peer_id);
+                } else {
+                    // Unresponsive peer: check if past next_sync_attempt
+                    // In Python: if hasattr(peer, "next_sync_attempt") and time.time() > peer.next_sync_attempt:
+                    let next_sync_attempt_s = peer.next_sync_attempt_ms() / 1000;
+                    if now_s >= next_sync_attempt_s {
+                        unresponsive_peers.push(peer_id);
+                    }
+                }
+            }
+        }
+        
+        // Select peer from pool (matching Python logic)
+        let mut peer_pool = Vec::new();
+        
+        if !waiting_peers.is_empty() {
+            // Sort by sync_transfer_rate (highest first) and take top FASTEST_N_RANDOM_POOL
+            let mut sorted: Vec<([u8; DESTINATION_LENGTH], f64)> = waiting_peers.iter()
+                .map(|&id| {
+                    let peer = self.peers.get(&id).expect("peer should exist");
+                    (id, peer.sync_transfer_rate())
+                })
+                .collect();
+            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            
+            let fastest_count = FASTEST_N_RANDOM_POOL.min(sorted.len());
+            let fastest_peers: Vec<[u8; DESTINATION_LENGTH]> = sorted[..fastest_count]
+                .iter()
+                .map(|(id, _)| *id)
+                .collect();
+            peer_pool.extend(fastest_peers.iter().copied());
+            
+            // Also add unknown speed peers (sync_transfer_rate == 0)
+            let unknown_speed: Vec<[u8; DESTINATION_LENGTH]> = sorted.iter()
+                .filter(|(_, rate)| *rate == 0.0)
+                .map(|(id, _)| *id)
+                .take(fastest_count)
+                .collect();
+            peer_pool.extend(unknown_speed);
+        } else if !unresponsive_peers.is_empty() {
+            // No active peers available, use unresponsive peers
+            peer_pool = unresponsive_peers;
+        }
+        
+        // Randomly select from peer pool
+        if !peer_pool.is_empty() {
+            use rand_core::RngCore;
+            // Use simple modulo for random selection (good enough for this use case)
+            let mut rng = rand_core::OsRng;
+            let random_bytes = rng.next_u64();
+            let selected_index = (random_bytes as usize) % peer_pool.len();
+            let selected_peer_id = peer_pool[selected_index];
+            
+            // Schedule sync for selected peer
+            let peering_key = self.peering_key_for_peer(selected_peer_id);
+            let req = self.peer_sync_offer(selected_peer_id, peering_key, now_ms);
+            self.peer_sync_queue.push_back((selected_peer_id, req));
+        }
+        
+        // Remove culled peers
+        for peer_id in culled_peers {
+            self.unpeer(peer_id);
+        }
+    }
+
+    /// Clean throttled peers (matching Python LXMRouter.clean_throttled_peers)
+    /// Removes expired entries from throttled_peers dict
+    pub fn clean_throttled_peers(&mut self, now_ms: u64) {
+        let expired: Vec<[u8; DESTINATION_LENGTH]> = self.throttled_peers
+            .iter()
+            .filter(|(_, &expiry_ms)| now_ms > expiry_ms)
+            .map(|(&peer_id, _)| peer_id)
+            .collect();
+        
+        for peer_id in expired {
+            self.throttled_peers.remove(&peer_id);
+        }
+    }
+
+    /// Add throttled peer (matching Python throttled_peers[peer_hash] = expiry_timestamp)
+    pub fn add_throttled_peer(&mut self, peer_id: [u8; DESTINATION_LENGTH], expiry_ms: u64) {
+        self.throttled_peers.insert(peer_id, expiry_ms);
+    }
+
+    /// Check if peer is throttled (matching Python peer_hash in throttled_peers and not expired)
+    pub fn is_peer_throttled(&self, peer_id: &[u8; DESTINATION_LENGTH], now_ms: u64) -> bool {
+        self.throttled_peers
+            .get(peer_id)
+            .map_or(false, |&expiry_ms| now_ms <= expiry_ms)
     }
 
     fn poll_peer_sync_timeouts(&mut self, now_ms: u64) {
